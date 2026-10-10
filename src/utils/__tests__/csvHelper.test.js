@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseCSV, arrayToCSV } from '../csvHelper';
+import { parseCSV, arrayToCSV, fuzzyFindIndex } from '../csvHelper';
 
 // ============================================================
 // parseCSV 测试
@@ -71,6 +71,36 @@ describe('parseCSV', () => {
       ['c', 'd'],
       ['e', 'f'],
     ]);
+  });
+});
+
+// ============================================================
+// fuzzyFindIndex 测试
+// ============================================================
+describe('fuzzyFindIndex', () => {
+  it('精确匹配大小写不敏感：表头 "CN" 命中关键字 "cn"', () => {
+    const headers = ['所在界面', '字号类别', 'KW', 'CN', '英文翻译'];
+    expect(fuzzyFindIndex(headers, ['cn'], ['中文'])).toBe(3);
+  });
+
+  it('精确匹配忽略列名前后空白', () => {
+    const headers = [' CN ', 'EN'];
+    expect(fuzzyFindIndex(headers, ['cn'], [])).toBe(0);
+  });
+
+  it('精确匹配未命中时回退到模糊包含匹配', () => {
+    const headers = ['所在界面', 'CN（中文）', '英文翻译'];
+    expect(fuzzyFindIndex(headers, ['cn'], ['中文'])).toBe(1);
+  });
+
+  it('无任何匹配时返回 -1', () => {
+    const headers = ['所在界面', '字号类别'];
+    expect(fuzzyFindIndex(headers, ['cn'], ['中文', '词条'])).toBe(-1);
+  });
+
+  it('多个精确关键字按顺序优先命中', () => {
+    const headers = ['en', 'cn'];
+    expect(fuzzyFindIndex(headers, ['cn', 'en'], [])).toBe(1);
   });
 });
 

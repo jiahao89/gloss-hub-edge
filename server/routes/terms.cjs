@@ -1097,26 +1097,54 @@ router.post('/tables/:tableId/batch-generate-kw', authenticateToken, async (req,
     }
     let updatedCount = 0;
     let skippedCount = 0;
+    let conflictCount = 0;
     const modifiedTerms = [];
 
     await db.transaction(async (tx) => {
+      // 预取本版本已占用的 KW，用于批次内去重 + 冲突预检，
+      // 避免触发 UNIQUE(version_id, kw) 唯一约束导致整个事务回滚（整批 500）
+      const occupiedRows = await tx.query('SELECT id, kw FROM terms WHERE version_id = $1', [tableId]);
+      const kwHolder = new Map();
+      for (const r of occupiedRows) {
+        const k = (r.kw || '').trim();
+        if (k && !k.startsWith('__EMPTY_KW_')) kwHolder.set(k, r.id);
+      }
+      const batchUsed = new Set();
+
+      // 尝试为本行占用一个 KW；批次内重复或已被其他词条占用时返回 false
+      const tryReserveKw = (kw, termId) => {
+        if (!kw) return false;
+        if (batchUsed.has(kw)) return false;
+        const holder = kwHolder.get(kw);
+        if (holder && holder !== termId) return false;
+        batchUsed.add(kw);
+        kwHolder.set(kw, termId);
+        return true;
+      };
+
       // 若前端已提供批量生成后的 updates 映射列表: [{ id, kw }]
       if (Array.isArray(updates) && updates.length > 0) {
         for (const item of updates) {
           if (!item.id || !item.kw) continue;
+          const kw = String(item.kw).trim();
+          if (!tryReserveKw(kw, item.id)) {
+            conflictCount++;
+            skippedCount++;
+            continue;
+          }
           if (dbType === 'postgres') {
             await tx.run(
               'UPDATE terms SET kw = $1, updated_at = NOW() WHERE id = $2 AND version_id = $3',
-              [item.kw, item.id, tableId]
+              [kw, item.id, tableId]
             );
           } else {
             await tx.run(
               "UPDATE terms SET kw = $1, updated_at = datetime('now') WHERE id = $2 AND version_id = $3",
-              [item.kw, item.id, tableId]
+              [kw, item.id, tableId]
             );
           }
           updatedCount++;
-          modifiedTerms.push({ id: item.id, kw: item.kw });
+          modifiedTerms.push({ id: item.id, kw });
         }
       } else {
         // 后端直接查询候选词条并执行生成
@@ -1154,6 +1182,16 @@ router.post('/tables/:tableId/batch-generate-kw', authenticateToken, async (req,
 
           const generatedKw = await generateKwHelper(projectId, term.zh_cn, enText, term.context);
           if (generatedKw) {
+            if (!tryReserveKw(generatedKw, term.id)) {
+              conflictCount++;
+              skippedCount++;
+              continue;
+            }
+            // 覆盖写时释放本行旧 KW 占用，避免其干扰同批次后续条目的冲突判定
+            const oldKw = (term.kw || '').trim();
+            if (oldKw && !oldKw.startsWith('__EMPTY_KW_') && oldKw !== generatedKw && kwHolder.get(oldKw) === term.id) {
+              kwHolder.delete(oldKw);
+            }
             if (dbType === 'postgres') {
               await tx.run(
                 'UPDATE terms SET kw = $1, updated_at = NOW() WHERE id = $2',
@@ -1194,9 +1232,10 @@ router.post('/tables/:tableId/batch-generate-kw', authenticateToken, async (req,
     });
 
     res.json({
-      message: `成功为 ${updatedCount} 条词条生成并更新 KW 键名！`,
+      message: `成功为 ${updatedCount} 条词条生成并更新 KW 键名！${conflictCount > 0 ? `（${conflictCount} 条因 KW 重复已跳过）` : ''}`,
       updatedCount,
       skippedCount,
+      conflictCount,
       modifiedTerms
     });
   } catch (err) {

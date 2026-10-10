@@ -54,14 +54,16 @@ export function parseCSV(text) {
  * @returns {number} The index of the matched header, or -1 if not found.
  */
 export function fuzzyFindIndex(headers, exactMatches, fuzzyKeywords) {
-  // 1. Exact match
+  // 1. Exact match (case-insensitive, ignore surrounding whitespace)
+  //    e.g. header "CN" must match exact keyword "cn"
   for (const match of exactMatches) {
-    const idx = headers.findIndex(h => h === match);
+    const target = match.trim().toLowerCase();
+    const idx = headers.findIndex(h => (h || '').trim().toLowerCase() === target);
     if (idx !== -1) return idx;
   }
   // 2. Fuzzy match
   return headers.findIndex(h => {
-    const lowerH = h.toLowerCase();
+    const lowerH = (h || '').toLowerCase();
     return fuzzyKeywords.some(kw => lowerH.includes(kw.toLowerCase()));
   });
 }
