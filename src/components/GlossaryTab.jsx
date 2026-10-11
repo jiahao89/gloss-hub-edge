@@ -245,6 +245,11 @@ export default function GlossaryTab({ projectRole }) {
 
         if (hasHeader) {
           startIdx = 1;
+          // 已识别表头时，未命中的列必须留空，不能再回退到列位置默认值（0/1/2），
+          // 否则会把「所在界面」「KW」等无关列错当成中文/释义列，导致 cn_term 全表错位。
+          finalCnIdx = -1;
+          finalEnIdx = -1;
+          finalDescIdx = -1;
           const mappings = [];
           if (cnIdx !== -1) {
             finalCnIdx = cnIdx;
