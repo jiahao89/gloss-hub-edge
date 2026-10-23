@@ -448,6 +448,21 @@ router.post('/projects/:projectId/ai-translate', authenticateToken, requireProje
           tmTranslations[lang] = String(rawVal || '');
         }
       });
+
+      // 默认不纠正调用方已提供的现存翻译
+      if (inputs.preserve_existing !== false && inputs.existing_translations && typeof inputs.existing_translations === 'object') {
+        Object.entries(inputs.existing_translations).forEach(([k, v]) => {
+          if (v && String(v).trim()) {
+            const matchedKey = Object.keys(tmTranslations).find(tk => tk === k || tk.replace(/语|文/g, '') === k.replace(/语|文/g, ''));
+            if (matchedKey) {
+              tmTranslations[matchedKey] = String(v).trim();
+            } else {
+              tmTranslations[k] = String(v).trim();
+            }
+          }
+        });
+      }
+
       return res.json({ ...tmTranslations, _source: 'tm' });
     }
 
@@ -472,6 +487,15 @@ router.post('/projects/:projectId/ai-translate', authenticateToken, requireProje
         });
       }
     });
+
+    // 如果传入了现有语种翻译（如英语已译），将其置顶为第一优先级的强制对齐约束
+    if (inputs.existing_translations && typeof inputs.existing_translations === 'object' && Object.keys(inputs.existing_translations).length > 0) {
+      matchedTerms.unshift({
+        "中文名词": zhCn,
+        "各语种强制翻译": inputs.existing_translations,
+        "重要规则": "当前词条已确认的现有翻译，请严格保持各目标语种含义与已有翻译对齐，切勿纠正或修改已有翻译"
+      });
+    }
 
     if (matchedTerms.length > 0) {
       // 限制最多注入 15 条最相关的名词约束，防止 prompt 过大导致 LLM 推理卡顿 30+ 秒

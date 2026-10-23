@@ -1,7 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import GlossaModal from '../GlossaModal';
 import { apiFetch } from '../../utils/api';
-import { findTranslationForLang } from '../../utils/languageHelper';
+import { 
+  findTranslationForLang, 
+  extractExistingTranslations, 
+  formatExistingReferenceContext, 
+  mergeTranslations 
+} from '../../utils/languageHelper';
 import { useToast } from '../Toast';
 import { Loader2, Sparkles } from 'lucide-react';
 
@@ -9,6 +14,7 @@ export default function AddTermModal({ open, onClose, selectedTableId, targetLan
   const toast = useToast();
   const [loading, setLoading] = useState(false);
   const [isTranslating, setIsTranslating] = useState(false);
+  const [preserveExisting, setPreserveExisting] = useState(true);
   
   // Initialize state based on fields
   const getInitialFields = () => {
@@ -89,13 +95,35 @@ export default function AddTermModal({ open, onClose, selectedTableId, targetLan
       return;
     }
 
+    const existingTrans = extractExistingTranslations(newFields, activeTargetLangs);
+    const existingCount = Object.keys(existingTrans).length;
+
+    // 如果启用了保留已有翻译（默认），且所有语言均已存在翻译，则提示无需重复翻译
+    if (preserveExisting && existingCount === activeTargetLangs.length) {
+      toast.info('所有目标语种均已有翻译。若需全部覆盖重新翻译，请取消勾选“保留已有翻译”');
+      return;
+    }
+
+    // 仅在保留已有翻译时，把请求语言缩小为缺失的语种，并附上已有参考
+    const missingLangs = preserveExisting
+      ? activeTargetLangs.filter(l => !existingTrans[l])
+      : activeTargetLangs;
+
     setIsTranslating(true);
     try {
+      let contextVal = (newFields['所在页面'] || '').trim();
+      const refSnippet = formatExistingReferenceContext(existingTrans);
+      if (refSnippet) {
+        contextVal = contextVal ? `${contextVal} (${refSnippet})` : refSnippet;
+      }
+
       const inputs = {
         KW: newFields.KW || '',
         text: newFields['CN（中文）'],
-        context: newFields['所在页面'] || '无',
-        target_languages: activeTargetLangs.join(',')
+        context: contextVal || '无',
+        target_languages: (missingLangs.length > 0 ? missingLangs : activeTargetLangs).join(','),
+        existing_translations: existingTrans,
+        preserve_existing: preserveExisting
       };
 
       const res = await apiFetch(`/api/projects/proj-default/ai-translate?debug=1`, {
@@ -110,17 +138,19 @@ export default function AddTermModal({ open, onClose, selectedTableId, targetLan
       }
 
       const result = await res.json().catch(() => ({}));
-      const updates = {};
-      activeTargetLangs.forEach(lang => {
-        const val = findTranslationForLang(result, lang);
-        if (val) {
-          updates[lang] = val;
-        }
+      const { updatedFields, changedCount, preservedCount } = mergeTranslations({
+        currentFields: newFields,
+        aiResult: result,
+        targetLanguages: activeTargetLangs,
+        preserveExisting
       });
 
-      if (Object.keys(updates).length > 0) {
-        setNewFields(prev => ({ ...prev, ...updates }));
-        toast.success('AI 翻译完成！');
+      if (changedCount > 0) {
+        setNewFields(updatedFields);
+        const msg = preservedCount > 0 
+          ? `AI 翻译完成！已补全 ${changedCount} 个语种，已保留 ${preservedCount} 个现存翻译`
+          : 'AI 翻译完成！';
+        toast.success(msg);
       } else {
         toast.info('AI 未返回对应的语言翻译，请检查目标语言');
       }
@@ -272,10 +302,24 @@ export default function AddTermModal({ open, onClose, selectedTableId, targetLan
           />
         </div>
 
-        <div style={{ gridColumn: 'span 2', marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>
-          <h4 style={{ fontSize: '0.9rem', marginBottom: '0', color: 'var(--text-primary)' }}>
-            目标语言翻译
-          </h4>
+        <div style={{ gridColumn: 'span 2', marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <h4 style={{ fontSize: '0.9rem', marginBottom: '0', color: 'var(--text-primary)' }}>
+              目标语言翻译
+            </h4>
+            <label 
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.78rem', color: 'var(--text-secondary)', cursor: 'pointer', userSelect: 'none' }}
+              title="勾选时默认保留已填语种不予修改，仅补充空白语种；取消勾选将全部覆盖重新翻译"
+            >
+              <input
+                type="checkbox"
+                checked={preserveExisting}
+                onChange={(e) => setPreserveExisting(e.target.checked)}
+                disabled={loading || isTranslating}
+              />
+              <span>保留已有翻译 (不纠正现存语种)</span>
+            </label>
+          </div>
           <button 
             type="button"
             onClick={handleAutoTranslate}

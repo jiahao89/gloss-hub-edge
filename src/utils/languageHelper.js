@@ -65,3 +65,75 @@ export const DEFAULT_TARGET_LANGUAGES = [
   'KO（韩）', 'JP（日）', 'RU（俄罗斯）', 'PL（波兰）', 'TC（繁）', 'DA（丹麦）', 
   'CZ(捷克)', '瑞典', '挪威', '荷兰', '泰语'
 ];
+
+/**
+ * Extract existing non-empty translations from a fields or row object.
+ *
+ * @param {Object} fieldsOrRow - Source fields or row.
+ * @param {Array<string>} targetLanguages - List of target languages to check.
+ * @returns {Record<string, string>} Map of language label to existing non-empty translation string.
+ */
+export function extractExistingTranslations(fieldsOrRow = {}, targetLanguages = []) {
+  if (!fieldsOrRow || typeof fieldsOrRow !== 'object') return {};
+  const existing = {};
+
+  targetLanguages.forEach(lang => {
+    const val = fieldsOrRow[lang];
+    if (val !== undefined && val !== null && String(val).trim() !== '') {
+      existing[lang] = String(val).trim();
+    }
+  });
+
+  return existing;
+}
+
+/**
+ * Format existing translations into a reference string for AI context.
+ *
+ * @param {Record<string, string>} existingTranslations - Map of language label to translation.
+ * @returns {string} Formatted context snippet, e.g. "已有现存翻译参考(保持一致，不予纠正): EN（英文）=\"Cadence\"".
+ */
+export function formatExistingReferenceContext(existingTranslations = {}) {
+  if (!existingTranslations || typeof existingTranslations !== 'object') return '';
+  const entries = Object.entries(existingTranslations).filter(([, v]) => v && String(v).trim());
+  if (entries.length === 0) return '';
+  const formatted = entries.map(([lang, val]) => `${lang}="${String(val).trim()}"`).join('; ');
+  return `已有现存翻译参考(保持一致，不予纠正): ${formatted}`;
+}
+
+/**
+ * Merge AI translation results into current fields.
+ * If preserveExisting is true (default), any language that already has a non-empty
+ * translation will NOT be overwritten or corrected.
+ *
+ * @param {Object} params
+ * @param {Object} params.currentFields - Current fields or row object.
+ * @param {Object} params.aiResult - Raw translation result from AI / TM.
+ * @param {Array<string>} params.targetLanguages - List of target language labels.
+ * @param {boolean} [params.preserveExisting=true] - Whether to preserve existing non-empty translations.
+ * @returns {{ updatedFields: Object, changedCount: number, preservedCount: number }}
+ */
+export function mergeTranslations({ currentFields = {}, aiResult = {}, targetLanguages = [], preserveExisting = true }) {
+  const updatedFields = { ...currentFields };
+  let changedCount = 0;
+  let preservedCount = 0;
+
+  targetLanguages.forEach(lang => {
+    const existingVal = currentFields[lang];
+    const hasExisting = existingVal !== undefined && existingVal !== null && String(existingVal).trim() !== '';
+
+    if (preserveExisting && hasExisting) {
+      preservedCount++;
+      return;
+    }
+
+    const aiVal = findTranslationForLang(aiResult, lang);
+    if (aiVal !== undefined && aiVal !== null && String(aiVal).trim() !== '') {
+      updatedFields[lang] = String(aiVal).trim();
+      changedCount++;
+    }
+  });
+
+  return { updatedFields, changedCount, preservedCount };
+}
+

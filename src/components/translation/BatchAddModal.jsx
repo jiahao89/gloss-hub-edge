@@ -1,7 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import GlossaModal from '../GlossaModal';
 import { apiFetch } from '../../utils/api';
-import { findTranslationForLang } from '../../utils/languageHelper';
+import { 
+  findTranslationForLang, 
+  extractExistingTranslations, 
+  formatExistingReferenceContext, 
+  mergeTranslations 
+} from '../../utils/languageHelper';
 import { useToast } from '../Toast';
 import { Plus, Trash2, Loader2, Sparkles } from 'lucide-react';
 
@@ -9,6 +14,7 @@ export default function BatchAddModal({ open, onClose, selectedTableId, onAddSuc
   const toast = useToast();
   const [loading, setLoading] = useState(false);
   const [isTranslating, setIsTranslating] = useState(false);
+  const [preserveExisting, setPreserveExisting] = useState(true);
   const [progress, setProgress] = useState({ total: 0, current: 0, status: '' });
   
   const getEmptyRow = () => {
@@ -137,12 +143,33 @@ export default function BatchAddModal({ open, onClose, selectedTableId, onAddSuc
 
       // We only translate if Chinese is provided, otherwise we just keep it
       if (row['CN（中文）']?.trim()) {
+        const existingTrans = extractExistingTranslations(row, targetLanguages);
+        const existingCount = Object.keys(existingTrans).length;
+
+        // 如果开启保留已有翻译，且本行所有目标语种均已手动填入，则无需调用 AI
+        if (preserveExisting && existingCount === targetLanguages.length) {
+          translatedRows.push(row);
+          continue;
+        }
+
+        const missingLangs = preserveExisting
+          ? targetLanguages.filter(l => !existingTrans[l])
+          : targetLanguages;
+
         try {
+          let contextVal = (row['所在页面'] || '').trim();
+          const refSnippet = formatExistingReferenceContext(existingTrans);
+          if (refSnippet) {
+            contextVal = contextVal ? `${contextVal} (${refSnippet})` : refSnippet;
+          }
+
           const inputs = {
             KW: row.KW || '',
             text: row['CN（中文）'],
-            context: row['所在页面'] || '无',
-            target_languages: targetLanguages.join(',')
+            context: contextVal || '无',
+            target_languages: (missingLangs.length > 0 ? missingLangs : targetLanguages).join(','),
+            existing_translations: existingTrans,
+            preserve_existing: preserveExisting
           };
 
           let res = null;
@@ -183,13 +210,12 @@ export default function BatchAddModal({ open, onClose, selectedTableId, onAddSuc
           
           const result = await res.json().catch(() => ({}));
 
-          // 不可变更新：以新对象替换旧行
-          const nextRow = { ...row };
-          targetLanguages.forEach(lang => {
-            const val = findTranslationForLang(result, lang);
-            if (val) {
-              nextRow[lang] = val;
-            }
+          // 使用 mergeTranslations 保证 preserveExisting 时不纠正/覆盖现存翻译
+          const { updatedFields: nextRow } = mergeTranslations({
+            currentFields: row,
+            aiResult: result,
+            targetLanguages,
+            preserveExisting
           });
 
           if (result._source === 'tm') {
@@ -252,10 +278,24 @@ export default function BatchAddModal({ open, onClose, selectedTableId, onAddSuc
       }
     >
       <div style={{ padding: '0 0.5rem', maxHeight: '70vh', overflowY: 'auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            * 留空的行在保存时会自动被忽略。至少需要填写中文。
-          </p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.6rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0 }}>
+              * 留空的行在保存时会自动被忽略。至少需要填写中文。
+            </p>
+            <label 
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer', userSelect: 'none' }}
+              title="勾选时默认保留已填语种不予修改，仅补充空白语种；取消勾选将全部覆盖重新翻译"
+            >
+              <input
+                type="checkbox"
+                checked={preserveExisting}
+                onChange={(e) => setPreserveExisting(e.target.checked)}
+                disabled={isBusy}
+              />
+              <span>保留已有翻译 (不纠正现存语种)</span>
+            </label>
+          </div>
           {targetLanguages.length === 0 && (
             <div className="alert-box alert-box-warning" style={{ margin: 0, padding: '0.4rem 0.8rem' }}>
               当前表没有检测到目标语言列，AI 翻译功能不可用

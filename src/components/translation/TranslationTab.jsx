@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { apiFetch, safeGetLocalStorage } from '../../utils/api';
-import { findTranslationForLang, DEFAULT_TARGET_LANGUAGES } from '../../utils/languageHelper';
+import { 
+  findTranslationForLang, 
+  DEFAULT_TARGET_LANGUAGES,
+  extractExistingTranslations,
+  formatExistingReferenceContext
+} from '../../utils/languageHelper';
 import { downloadBlob, buildExportFilename } from '../../utils/download.js';
 import { useToast } from '../Toast';
 import { BatchCategoryModal, BatchCopyModal, BatchApproveModal } from './BatchActionsModal';
@@ -335,12 +340,21 @@ export default function TranslationTab({
       const { item, index: i, effectiveMissingLangs } = task;
       try {
         const targetLangsReq = effectiveMissingLangs.join(',');
+        const existingTrans = extractExistingTranslations(item.existingFields, targetLanguagesList);
+
+        let contextVal = (item['所在页面'] || '').trim();
+        const refSnippet = formatExistingReferenceContext(existingTrans);
+        if (refSnippet) {
+          contextVal = contextVal ? `${contextVal} (${refSnippet})` : refSnippet;
+        }
 
         const inputs = {
           KW: item.KW,
           text: item['中文'],
-          context: item['所在页面'] || '无',
-          target_languages: targetLangsReq
+          context: contextVal || '无',
+          target_languages: targetLangsReq,
+          existing_translations: existingTrans,
+          preserve_existing: true
         };
 
         let res = null;
