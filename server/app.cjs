@@ -70,10 +70,12 @@ app.use(async (_req, res, next) => {
     await ensureDbInit();
     next();
   } catch (err) {
-    // 注意: 不要把 err.message 暴露给客户端 — PG/驱动错误常包含主机/端口/账号片段,
-    // 容易成为凭证枚举的入口。详细堆栈只写服务端日志。
-    console.error('❌ DB 初始化异常:', err);
-    res.status(500).json({ error: '数据库初始化失败，请联系管理员。' });
+    // 详细堆栈写服务端日志，对外提供明确友好指导信息
+    console.error('❌ DB 初始化/连接异常:', err.message);
+    res.status(503).json({ 
+      error: '云端数据库连接失败或正在从休眠中唤醒，请稍候 30 秒刷新重试。',
+      code: 'DB_UNAVAILABLE'
+    });
   }
 });
 
@@ -93,14 +95,21 @@ app.use('/api/logs', logRoutes);
 // Start Server (only when NOT running in Vercel Serverless Environment)
 let server = null;
 if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
-  ensureDbInit().then(() => {
-    server = app.listen(PORT, () => {
-      console.log(`🌐 GlossaHub 协同数据日志服务已启动，监听端口: ${PORT}`);
-      console.log(`📡 数据库引擎: [${getDbType().toUpperCase()}]`);
+  const startServer = () => {
+    if (!server) {
+      server = app.listen(PORT, () => {
+        console.log(`🌐 GlossaHub 协同数据日志服务已启动，监听端口: ${PORT}`);
+        console.log(`📡 数据库引擎: [${getDbType().toUpperCase()}]`);
+      });
+    }
+  };
+
+  ensureDbInit()
+    .then(startServer)
+    .catch(err => {
+      console.error('⚠️ 服务器启动初次连接 DB 失败 (Express 将照常监听端口以便接收请求并自动重试连接):', err.message);
+      startServer();
     });
-  }).catch(err => {
-    console.error('❌ 服务器启动时初始化数据库失败:', err.message);
-  });
 }
 
 // 优雅关机 (Graceful Shutdown)
