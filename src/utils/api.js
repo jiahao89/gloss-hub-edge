@@ -39,6 +39,19 @@ export async function apiFetch(url, options = {}) {
     throw new Error('登录已过期，请重新登录');
   }
 
+  // 503: 数据库不可用或正在从休眠中唤醒
+  if (res.status === 503) {
+    let errMsg = '云端数据库连接失败或正在从休眠中唤醒，请稍候 30 秒刷新重试。';
+    try {
+      if (typeof res.clone === 'function') {
+        const cloned = res.clone();
+        const data = await cloned.json();
+        if (data && data.error) errMsg = data.error;
+      }
+    } catch {}
+    throw new Error(errMsg);
+  }
+
   return res;
 }
 

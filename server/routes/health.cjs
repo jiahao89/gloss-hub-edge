@@ -1,17 +1,28 @@
 const express = require('express');
 const router = express.Router();
-const { getDbType, getDbInitError, getPgError, getPgDebug } = require('../config/db.cjs');
+const { db, ensureDbInit, getDbType, getPgError, getPgDebug } = require('../config/db.cjs');
 const { authenticateToken } = require('../middleware/auth.cjs');
 
-router.get('/health', (_req, res) => {
-  const dbInitError = getDbInitError();
-  const pgErr = getPgError();
-  // 错误详情只写服务端日志, 不向无鉴权的探针暴露 (可能含主机/账号片段)
-  if (dbInitError || pgErr) {
-    console.error('🩺 健康检查发现数据库异常:', dbInitError ? dbInitError.message : '', pgErr || '');
+router.get('/health', async (_req, res) => {
+  let dbStatus = 'ok';
+  let dbLatency = 0;
+
+  try {
+    const start = Date.now();
+    await ensureDbInit();
+    // 实际执行一条轻量查询，既能探测真实连接状态，也能持续刷新 Supabase 的 7 天不活跃休眠倒计时
+    await db.queryOne('SELECT 1 as ping');
+    dbLatency = Date.now() - start;
+  } catch (err) {
+    dbStatus = 'error';
+    console.error('🩺 /health 数据库主动探测失败:', err.message);
   }
-  res.json({
-    status: dbInitError ? 'db_error' : 'ok',
+
+  const isHealthy = dbStatus === 'ok';
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'ok' : 'degraded',
+    dbStatus,
+    dbLatencyMs: dbLatency,
     dbType: getDbType(),
     timestamp: new Date().toISOString()
   });

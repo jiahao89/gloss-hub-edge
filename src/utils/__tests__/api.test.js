@@ -135,6 +135,18 @@ describe('apiFetch', () => {
     await expect(apiFetch('/api/data')).rejects.toThrow('网络请求失败');
   });
 
+  it('503 响应时抛出包含服务器提示的友好错误 (数据库休眠或不可用)', async () => {
+    localStorageMock.getItem.mockReturnValue(null);
+    mockFetch.mockResolvedValue({
+      status: 503,
+      clone: () => ({
+        json: async () => ({ error: '云端数据库正在从休眠中唤醒，请稍候 30 秒刷新重试。' })
+      })
+    });
+
+    await expect(apiFetch('/api/terms')).rejects.toThrow('云端数据库正在从休眠中唤醒，请稍候 30 秒刷新重试。');
+  });
+
   it('透传其他 options 参数（如 method, body）', async () => {
     localStorageMock.getItem.mockReturnValue('tok');
     mockFetch.mockResolvedValue({ status: 200 });

@@ -605,10 +605,30 @@ async function initDatabase() {
       }
     } catch (err) {
       pgError = err.message;
-      console.warn('⚠️ 连接 PostgreSQL 失败，自动切换为本地 SQLite 数据库:', err.message);
+      if (pgPool) {
+        try { await pgPool.end(); } catch {}
+        pgPool = null;
+      }
+      const isCloudOrProd = process.env.NODE_ENV === 'production' || 
+                            !!process.env.RENDER || 
+                            !!process.env.VERCEL || 
+                            !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+      if (isCloudOrProd) {
+        console.error('❌ 云端/生产环境 PostgreSQL 数据库连接失败，严禁降级到临时 SQLite！', err.message);
+        throw new Error(`云端 PostgreSQL 数据库连接失败（若使用 Supabase 免费层，可能因长时间无访问进入休眠状态，请前往 Supabase 控制台唤醒）: ${err.message}`);
+      }
+      console.warn('⚠️ 连接 PostgreSQL 失败，本地开发模式自动切换为 SQLite 数据库:', err.message);
       await initSqlite();
     }
   } else {
+    const isCloudOrProd = process.env.NODE_ENV === 'production' || 
+                          !!process.env.RENDER || 
+                          !!process.env.VERCEL || 
+                          !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+    if (isCloudOrProd) {
+      console.error('❌ 云端/生产环境缺少 DATABASE_URL 配置，拒绝启动无持久化 SQLite！');
+      throw new Error('生产环境未配置 DATABASE_URL 环境变量，无法持久化数据！');
+    }
     await initSqlite();
   }
 }

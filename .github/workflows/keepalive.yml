@@ -1,0 +1,40 @@
+name: GlossaHub Keepalive & Anti-Sleep
+
+on:
+  schedule:
+    # 每天 04:00 与 16:00 UTC (北京时间 12:00 与 00:00) 自动触发一次心跳探测
+    - cron: '0 4,16 * * *'
+  workflow_dispatch: # 支持手动点击运行测试
+
+jobs:
+  heartbeat:
+    name: Ping Backend & Refresh Supabase Activity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping GlossaHub Health Check
+        run: |
+          echo "Sending keep-alive heartbeat to GlossaHub backend..."
+          URL="https://glossa-hub.onrender.com/api/health"
+          
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 60 "$URL" || true)
+          echo "$RESPONSE"
+          STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d':' -f2)
+
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Heartbeat successful. Database is active and responsive."
+          elif [ "$STATUS" = "503" ]; then
+            echo "⚠️ Backend responded with 503 (database waking up / cold start). Waiting 30s for recovery..."
+            sleep 30
+            RETRY_RES=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 60 "$URL" || true)
+            echo "$RETRY_RES"
+            RETRY_STATUS=$(echo "$RETRY_RES" | grep "HTTP_STATUS" | cut -d':' -f2)
+            if [ "$RETRY_STATUS" = "200" ]; then
+              echo "✅ Recovery verified: Database successfully connected."
+            else
+              echo "❌ Retry returned HTTP $RETRY_STATUS"
+              exit 1
+            fi
+          else
+            echo "❌ Unexpected response status: $STATUS"
+            exit 1
+          fi
