@@ -68,7 +68,7 @@ export default function BatchAddModal({ open, onClose, selectedTableId, onAddSuc
 
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || '批量新增写入失败');
+      throw new Error(data.message || data.error || '批量新增写入失败');
     }
 
     toast.success(`成功批量新增 ${addedForSync.length} 条记录`);

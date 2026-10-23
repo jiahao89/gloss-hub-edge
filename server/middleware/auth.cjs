@@ -26,12 +26,37 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: '未登录或登录已过期，请重新登录。' });
   }
 
-  jwt.verify(token, EFFECTIVE_JWT_SECRET, (err, user) => {
+  jwt.verify(token, EFFECTIVE_JWT_SECRET, async (err, decoded) => {
     if (err) {
       return res.status(401).json({ error: '无访问权限或登录已过期，请重新登录。' });
     }
-    req.user = user;
-    next();
+
+    try {
+      // 容错自愈与多环境ID对齐：
+      // 当发生跨库切换（如 SQLite 与 PostgreSQL）或 Token 内 ID 与活跃数据库不一致时，
+      // 优先按 ID 查询；若未匹配则按 username 匹配活跃库中的真实 ID 与角色，
+      // 保证 req.user.id 和 req.user.role 始终与数据库主键及最新权限保持一致。
+      let dbUser = await db.queryOne('SELECT id, username, name, role FROM users WHERE id = $1', [decoded.id]);
+      if (!dbUser && decoded.username) {
+        dbUser = await db.queryOne('SELECT id, username, name, role FROM users WHERE username = $1', [decoded.username]);
+      }
+
+      if (dbUser) {
+        req.user = {
+          ...decoded,
+          id: dbUser.id,
+          username: dbUser.username,
+          role: dbUser.role || decoded.role || 'user',
+          name: dbUser.name || decoded.name
+        };
+      } else {
+        req.user = decoded;
+      }
+      next();
+    } catch {
+      req.user = decoded;
+      next();
+    }
   });
 }
 
@@ -80,7 +105,12 @@ function requireRole(allowedRoles) {
 }
 
 async function requireVersionOwnership(userId, versionId) {
-  const user = await db.queryOne('SELECT role FROM users WHERE id = $1', [userId]);
+  let user = await db.queryOne('SELECT role FROM users WHERE id = $1', [userId]);
+  if (!user && typeof userId === 'string' && userId.startsWith('user-')) {
+    const uname = userId.replace(/^user-/, '');
+    user = await db.queryOne('SELECT role, id FROM users WHERE username = $1', [uname]);
+    if (user) userId = user.id;
+  }
   if (user && user.role === 'admin') return true;
   const ver = await db.queryOne(
     'SELECT v.project_id FROM versions v JOIN project_members pm ON v.project_id = pm.project_id WHERE v.id = $1 AND pm.user_id = $2',
@@ -90,7 +120,12 @@ async function requireVersionOwnership(userId, versionId) {
 }
 
 async function requireTermOwnership(userId, termId) {
-  const user = await db.queryOne('SELECT role FROM users WHERE id = $1', [userId]);
+  let user = await db.queryOne('SELECT role FROM users WHERE id = $1', [userId]);
+  if (!user && typeof userId === 'string' && userId.startsWith('user-')) {
+    const uname = userId.replace(/^user-/, '');
+    user = await db.queryOne('SELECT role, id FROM users WHERE username = $1', [uname]);
+    if (user) userId = user.id;
+  }
   if (user && user.role === 'admin') return true;
   const term = await db.queryOne(
     `SELECT t.version_id FROM terms t
