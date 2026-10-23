@@ -73,17 +73,25 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
         });
 
         // --- Build CSV Objects ---
-        const csvRecords = rows.map((row, ridx) => {
+        const validCsvRecords = [];
+        let orderCounter = 1;
+        rows.forEach((row, ridx) => {
           const fields = {};
           colMap.forEach(({ idx, fieldName }) => {
             if (row[idx] !== undefined) fields[fieldName] = row[idx];
           });
-          return {
-            recordId: `csv-import-${ridx}`,
-            fields,
-            kw: (fields['KW'] || '').trim(),
-          };
-        }).filter(r => r.kw || (r.fields['CN（中文）'] && r.fields['CN（中文）'].trim() !== ''));
+          const kw = (fields['KW'] || '').trim();
+          const zh = (fields['CN（中文）'] || '').trim();
+          if (kw || zh) {
+            validCsvRecords.push({
+              recordId: `csv-import-${ridx}`,
+              fields,
+              kw,
+              csvOrder: orderCounter++,
+            });
+          }
+        });
+        const csvRecords = validCsvRecords;
 
         if (csvRecords.length === 0) {
           toast.error('CSV 文件中没有有效的数据！');
@@ -131,14 +139,14 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
         allCurrentRecords.forEach(rec => {
           const kw = (rec.fields?.['KW'] || rec.kw || '').trim();
           const zh = (rec.fields?.['CN（中文）'] || rec.zh_cn || '').trim();
-          if (kw) currentByKw[kw.toLowerCase()] = rec;
+          if (kw && !kw.startsWith('__EMPTY_KW_')) currentByKw[kw.toLowerCase()] = rec;
           if (zh) currentByZh[zh] = rec;
         });
 
         const added = [];
         const modified = [];
         const unchanged = [];
-        const usedKws = new Set();
+        const matchedRecordIds = new Set();
 
         csvRecords.forEach(csvRec => {
           const csvKw = (csvRec.kw || '').toLowerCase();
@@ -150,11 +158,18 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
 
           if (!existing) {
             added.push(csvRec);
-            if (csvKw) usedKws.add(csvKw);
           } else {
+            const existingId = existing.id || existing.recordId;
+            if (existingId) matchedRecordIds.add(existingId);
+            if (csvKw) delete currentByKw[csvKw];
             const existingKw = (existing.fields?.['KW'] || existing.kw || '').trim().toLowerCase();
-            if (existingKw) usedKws.add(existingKw);
-            if (csvKw) usedKws.add(csvKw);
+            if (existingKw && !existingKw.startsWith('__empty_kw_')) {
+              delete currentByKw[existingKw];
+            }
+            const existingZh = (existing.fields?.['CN（中文）'] || existing.zh_cn || '').trim();
+            if (existingZh) {
+              delete currentByZh[existingZh];
+            }
 
             const changes = {};
             const allFields = ['KW', 'CN（中文）', ...targetLanguages];
@@ -174,16 +189,21 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
         });
 
         const removed = allCurrentRecords.filter(rec => {
-          const kw = (rec.fields?.['KW'] || rec.kw || '').trim().toLowerCase();
-          return kw && !usedKws.has(kw);
+          const id = rec.id || rec.recordId;
+          return id && !matchedRecordIds.has(id);
         });
 
-        if (added.length === 0 && modified.length === 0) {
+        const orderChanged = unchanged.some(rec => {
+          const curSort = rec.existingRecord?.sort_order ?? rec.existingRecord?.sortOrder;
+          return curSort !== rec.csvOrder;
+        });
+
+        if (added.length === 0 && modified.length === 0 && !orderChanged) {
           toast.info(`没有检测到变化（${unchanged.length} 条一致，${removed.length} 条不在CSV中）`);
           return;
         }
 
-        setImportDiff({ added, modified, unchanged, removed, csvRecords });
+        setImportDiff({ added, modified, unchanged, removed, csvRecords, orderChanged });
         setImportPreviewOpen(true);
       } catch (err) {
         toast.error(`解析 CSV 失败: ${err.message}`);
@@ -201,12 +221,6 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
     try {
       setLoading(true);
 
-      // Build sort order map from original CSV row order
-      const csvSortMap = {};
-      importDiff.csvRecords.forEach((rec, idx) => {
-        csvSortMap[rec.kw.toLowerCase()] = idx;
-      });
-      // Records not in CSV (removed) get placed after all CSV records
       const csvMaxSort = importDiff.csvRecords.length;
 
       const addedForSync = importDiff.added.map(rec => {
@@ -214,7 +228,7 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
         return {
           recordId: newRecordId,
           fields: rec.fields,
-          sortOrder: csvSortMap[rec.kw.toLowerCase()] ?? csvMaxSort
+          sortOrder: rec.csvOrder ?? csvMaxSort
         };
       });
 
@@ -227,18 +241,28 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
         return {
           recordId: existingRecordId,
           fields: newFields,
-          sortOrder: csvSortMap[rec.kw.toLowerCase()] ?? csvMaxSort
+          sortOrder: rec.csvOrder ?? csvMaxSort
         };
       });
 
       // Reorder unchanged records to match CSV positions
-      const reorderForSync = importDiff.unchanged.map(rec => {
-        const existingRecordId = rec.existingRecord?.id || rec.existingRecord?.recordId || rec.recordId;
-        return {
-          recordId: existingRecordId,
-          sortOrder: csvSortMap[rec.kw.toLowerCase()] ?? csvMaxSort
-        };
-      }).filter(r => r.recordId && r.sortOrder !== undefined);
+      // And place removed records (existing records not in CSV) after all CSV records
+      const reorderForSync = [
+        ...importDiff.unchanged.map(rec => {
+          const existingRecordId = rec.existingRecord?.id || rec.existingRecord?.recordId || rec.recordId;
+          return {
+            recordId: existingRecordId,
+            sortOrder: rec.csvOrder ?? csvMaxSort
+          };
+        }),
+        ...(importDiff.removed || []).map((rec, idx) => {
+          const existingRecordId = rec.id || rec.recordId;
+          return {
+            recordId: existingRecordId,
+            sortOrder: csvMaxSort + 1 + idx
+          };
+        })
+      ].filter(r => r.recordId && r.sortOrder !== undefined);
 
       const res = await apiFetch(`/api/tables/${selectedTableId}/sync`, {
         method: 'POST',
@@ -255,12 +279,12 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
         throw new Error(data.error || '批量同步失败');
       }
 
-      toast.success(`导入成功！新增 ${addedForSync.length} 条，更新 ${updatedForSync.length} 条。`);
+      toast.success(`导入成功！新增 ${addedForSync.length} 条，更新 ${updatedForSync.length} 条，已按 CSV 顺序排列。`);
       setImportPreviewOpen(false);
       setImportDiff(null);
       
       if (onImportComplete) {
-        onImportComplete({ added: addedForSync, updated: updatedForSync });
+        onImportComplete({ added: addedForSync, updated: updatedForSync, reorder: reorderForSync });
       }
     } catch (err) {
       toast.error(err.message);
@@ -299,17 +323,22 @@ export default function CSVImportHandler({ selectedTableId, currentRecords, targ
             <>
               <button onClick={() => setImportPreviewOpen(false)} className="btn btn-secondary" disabled={loading}>取消</button>
               <button onClick={handleConfirmImport} className="btn btn-primary" disabled={loading}>
-                {loading ? '正在导入...' : `确认导入 (新增 ${importDiff.added.length}, 修改 ${importDiff.modified.length})`}
+                {loading ? '正在导入...' : (
+                  importDiff.added.length === 0 && importDiff.modified.length === 0
+                    ? `确认按 CSV 顺序排列 (${importDiff.unchanged.length} 条)`
+                    : `确认导入 (新增 ${importDiff.added.length}, 修改 ${importDiff.modified.length})`
+                )}
               </button>
             </>
           }
         >
           <div style={{ marginBottom: '1rem', padding: '0.8rem', background: 'var(--bg-panel)', borderRadius: '6px' }}>
-            <div style={{ display: 'flex', gap: '2rem', marginBottom: '1rem' }}>
+            <div style={{ display: 'flex', gap: '2rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
               <div><strong>新增词条：</strong> <span style={{ color: 'var(--green)' }}>{importDiff.added.length} 条</span></div>
               <div><strong>修改词条：</strong> <span style={{ color: 'var(--blue)' }}>{importDiff.modified.length} 条</span></div>
               <div><strong>无变化：</strong> <span style={{ color: 'var(--text-muted)' }}>{importDiff.unchanged.length} 条</span></div>
-              {importDiff.removed.length > 0 && <span style={{ color: 'var(--red)' }}>CSV外 {importDiff.removed.length} 条 (不受影响)</span>}
+              {importDiff.orderChanged && <div><strong>顺序更新：</strong> <span style={{ color: 'var(--blue)' }}>按 CSV 文件顺序</span></div>}
+              {importDiff.removed.length > 0 && <span style={{ color: 'var(--red)' }}>CSV外 {importDiff.removed.length} 条 (不受影响，排在最后)</span>}
             </div>
 
             {importDiff.added.length > 0 && (
