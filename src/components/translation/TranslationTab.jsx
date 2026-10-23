@@ -1110,6 +1110,11 @@ export default function TranslationTab({
                   return next;
                 });
               }
+              // 导入完成后重置排序与分页，确保词条按照 CSV 文件的原始顺序呈现
+              setSortBy('default');
+              setSortField(null);
+              setSortDirection(null);
+              setCurrentPage(1);
               loadTableData(selectedTableId);
             }}
             disabled={loading}

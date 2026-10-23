@@ -141,7 +141,10 @@ router.get('/tables/:tableId/records', authenticateToken, async (req, res) => {
       const transMeta = parseJsonField(term.translations_meta);
 
       return {
+        id: term.id,
         recordId: term.id,
+        sortOrder: term.sort_order,
+        sort_order: term.sort_order,
         createdAt: term.created_at,
         updatedAt: term.updated_at,
         isLocked: term.is_locked || 0,
@@ -1461,20 +1464,21 @@ router.post('/tables/:tableId/sync', authenticateToken, writeLimiter, async (req
         const translationsMetaStr = JSON.stringify(mergedMeta || {});
         const nowStr = new Date().toISOString();
 
+        const hasSortOrder = rec.sortOrder !== undefined;
         await tx.query(`
           UPDATE terms
-          SET kw = $1, context = $2, zh_cn = $3, translations = $4, translations_meta = $5, updated_at = $6${rec.sortOrder !== undefined ? ', sort_order = $9' : ''}
-          WHERE id = $7 AND version_id = $8 AND (is_locked IS NOT TRUE)
-        `, rec.sortOrder !== undefined ? [
+          SET kw = $1, context = $2, zh_cn = $3, translations = $4, translations_meta = $5, updated_at = $6${hasSortOrder ? ', sort_order = $7' : ''}
+          WHERE id = $${hasSortOrder ? 8 : 7} AND version_id = $${hasSortOrder ? 9 : 8} AND (is_locked IS NOT TRUE)
+        `, hasSortOrder ? [
           kwVal,
           contextVal,
           zhCnVal,
           fieldsStr,
           translationsMetaStr,
           nowStr,
+          rec.sortOrder,
           rec.recordId,
-          tableId,
-          rec.sortOrder
+          tableId
         ] : [
           kwVal,
           contextVal,
