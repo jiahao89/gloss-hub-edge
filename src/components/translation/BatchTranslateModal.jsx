@@ -123,7 +123,7 @@ export default function BatchTranslateModal({
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-primary)' }}>
               <span>🌐 翻译语种范围</span>
               <span style={{ fontSize: '0.72rem', fontWeight: 'normal', color: 'var(--text-muted)' }}>
-                (点击标签可排除不需要翻译的语种，排除后不会调用 Dify 翻译该语言)
+                (默认保留已有翻译，仅对缺失语种进行智能补全；点击标签可额外排除语种)
               </span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>

@@ -2,7 +2,12 @@ import React, { useState, useEffect, useRef } from 'react';
 import GlossaModal from '../GlossaModal';
 import { Sparkles, Loader2, History, GitBranch, RotateCcw, Eraser, RefreshCw } from 'lucide-react';
 import { apiFetch } from '../../utils/api';
-import { findTranslationForLang } from '../../utils/languageHelper';
+import { 
+  findTranslationForLang, 
+  extractExistingTranslations, 
+  formatExistingReferenceContext, 
+  mergeTranslations 
+} from '../../utils/languageHelper';
 import { useToast } from '../Toast';
 
 // ============================================================
@@ -47,6 +52,7 @@ export default function EditTermModal({
   const [loading, setLoading] = useState(false);
   const [generatingKw, setGeneratingKw] = useState(false);
   const [retranslating, setRetranslating] = useState(false);
+  const [preserveExisting, setPreserveExisting] = useState(true);
 
   // Right-side tab: 'tm' (跨版本参考) | 'history' (修改历史快照)
   // v1.2 重构后此功能丢失 — 现在恢复
@@ -148,7 +154,7 @@ export default function EditTermModal({
     toast.success('已清空翻译，点击「保存修改」确认');
   };
 
-  // 重新翻译：调用 AI 翻译接口, 更新词条全部翻译（仅写入表单, 需保存才生效）
+  // 重新翻译：调用 AI 翻译接口, 更新词条翻译（默认保留已有翻译不予纠正，仅写入表单, 需保存才生效）
   const handleRetranslate = async () => {
     const cn = (fields['CN（中文）'] || '').trim();
     if (!cn) {
@@ -160,13 +166,35 @@ export default function EditTermModal({
       toast.error('暂无目标语言');
       return;
     }
+
+    const existingTrans = extractExistingTranslations(fields, langs);
+    const existingCount = Object.keys(existingTrans).length;
+
+    // 如果开启保留已有翻译（默认），且所有语言均已存在翻译，提醒用户取消勾选才能全部覆盖重新翻译
+    if (preserveExisting && existingCount === langs.length) {
+      toast.info('当前所有语种均已有翻译。若需全部覆盖重新翻译，请取消勾选“保留已有翻译”');
+      return;
+    }
+
+    const missingLangs = preserveExisting
+      ? langs.filter(l => !existingTrans[l])
+      : langs;
+
     setRetranslating(true);
     try {
+      let contextVal = (fields['所在页面'] || '').trim();
+      const refSnippet = formatExistingReferenceContext(existingTrans);
+      if (refSnippet) {
+        contextVal = contextVal ? `${contextVal} (${refSnippet})` : refSnippet;
+      }
+
       const inputs = {
         KW: (fields.KW || '').trim(),
         text: cn,
-        context: (fields['所在页面'] || '').trim() || '无',
-        target_languages: langs.join(','),
+        context: contextVal || '无',
+        target_languages: (missingLangs.length > 0 ? missingLangs : langs).join(','),
+        existing_translations: existingTrans,
+        preserve_existing: preserveExisting,
       };
       const res = await apiFetch(`/api/projects/${projectId}/ai-translate`, {
         method: 'POST',
@@ -178,17 +206,22 @@ export default function EditTermModal({
         throw new Error(data.error || '翻译接口失败');
       }
       const result = await res.json().catch(() => ({}));
-      const updated = {};
-      langs.forEach(lang => {
-        const val = findTranslationForLang(result, lang);
-        if (val) updated[lang] = val;
+      const { updatedFields, changedCount, preservedCount } = mergeTranslations({
+        currentFields: fields,
+        aiResult: result,
+        targetLanguages: langs,
+        preserveExisting
       });
-      if (Object.keys(updated).length === 0) {
+
+      if (changedCount === 0) {
         toast.error('AI 未返回有效翻译结果，请稍后重试');
         return;
       }
-      setFields(prev => ({ ...prev, ...updated }));
-      toast.success(`重新翻译完成，已更新 ${Object.keys(updated).length} 个语种，点击「保存修改」确认`);
+      setFields(updatedFields);
+      const successMsg = preservedCount > 0
+        ? `翻译完成，已补充 ${changedCount} 个语种，已保留 ${preservedCount} 个现存翻译，点击「保存修改」确认`
+        : `重新翻译完成，已更新 ${changedCount} 个语种，点击「保存修改」确认`;
+      toast.success(successMsg);
     } catch (err) {
       toast.error(err.message || '重新翻译失败');
     } finally {
@@ -451,7 +484,27 @@ export default function EditTermModal({
           <h4 style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.9rem', marginBottom: '0.5rem', color: 'var(--text-primary)', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>
             <span>目标语言翻译</span>
             {!inputsDisabled && canWrite && (
-              <span style={{ display: 'inline-flex', gap: '0.6rem' }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.6rem' }}>
+                <label 
+                  style={{ 
+                    display: 'inline-flex', 
+                    alignItems: 'center', 
+                    gap: '0.25rem', 
+                    fontSize: '0.75rem', 
+                    color: 'var(--text-secondary)', 
+                    cursor: 'pointer', 
+                    userSelect: 'none'
+                  }} 
+                  title="勾选时默认保留已填语种不予修改，仅补充空白语种；取消勾选将全部覆盖重新翻译"
+                >
+                  <input
+                    type="checkbox"
+                    checked={preserveExisting}
+                    onChange={(e) => setPreserveExisting(e.target.checked)}
+                    disabled={transToolsDisabled}
+                  />
+                  <span>保留已有翻译</span>
+                </label>
                 <button
                   type="button"
                   onClick={handleClearTranslations}
@@ -485,7 +538,7 @@ export default function EditTermModal({
                     padding: '0.15rem 0.5rem',
                     borderRadius: '4px',
                   }}
-                  title="调用 AI 重新翻译全部语种（需保存后生效）"
+                  title={preserveExisting ? "调用 AI 补充缺失语种翻译（保留现有翻译不予修改）" : "调用 AI 重新翻译全部语种（覆盖所有语种）"}
                 >
                   {retranslating ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
                   <span>{retranslating ? '翻译中...' : '重新翻译'}</span>

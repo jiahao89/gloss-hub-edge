@@ -249,6 +249,127 @@ describe('EditTermModal', () => {
     expect(mockOnSaveSuccess).not.toHaveBeenCalled();
   });
 
+  it('重新翻译时，如果已有英语翻译，默认不纠正当前英语翻译，仅补充空白语种', async () => {
+    const recordWithEn = {
+      recordId: 'rec-456',
+      id: 'rec-456',
+      fields: {
+        'KW': 'KW_CADENCE',
+        'CN（中文）': '踏频',
+        'EN（英文）': 'Existing Cadence',
+        'FR（法）': ''
+      }
+    };
+
+    mockFetch.mockImplementation((url) => {
+      if (String(url).includes('ai-translate')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            'EN（英文）': 'AI Modified Cadence', // AI 试图纠正/更改英语
+            'FR（法）': 'Cadence FR'
+          })
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => [] });
+    });
+
+    render(
+      <ToastProvider>
+        <EditTermModal
+          open={true}
+          record={recordWithEn}
+          fieldMap={{ ...fieldMap, 'FR（法）': 'f_fr' }}
+          getRecordValue={getRecordValue}
+          targetLanguages={['EN（英文）', 'FR（法）']}
+          projectRole="editor"
+          onClose={mockOnClose}
+        />
+      </ToastProvider>
+    );
+
+    // 验证初始状态：英语输入框显示已有的 "Existing Cadence"
+    expect(screen.getByDisplayValue('Existing Cadence')).toBeInTheDocument();
+
+    // 点击重新翻译（默认勾选"保留已有翻译"）
+    fireEvent.click(screen.getByText('重新翻译').closest('button'));
+
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/projects/proj-default/ai-translate'),
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.stringContaining('"preserve_existing":true')
+        })
+      );
+    });
+
+    // 验证：已有的英语翻译没有被纠正/覆盖，仍为 "Existing Cadence"
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('Existing Cadence')).toBeInTheDocument();
+      expect(screen.queryByDisplayValue('AI Modified Cadence')).not.toBeInTheDocument();
+      // 空白的法语被填入
+      expect(screen.getByDisplayValue('Cadence FR')).toBeInTheDocument();
+    });
+  });
+
+  it('取消勾选"保留已有翻译"后，重新翻译将覆盖已有的英语翻译', async () => {
+    const recordWithEn = {
+      recordId: 'rec-456',
+      id: 'rec-456',
+      fields: {
+        'KW': 'KW_CADENCE',
+        'CN（中文）': '踏频',
+        'EN（英文）': 'Existing Cadence',
+        'FR（法）': ''
+      }
+    };
+
+    mockFetch.mockImplementation((url) => {
+      if (String(url).includes('ai-translate')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            'EN（英文）': 'AI Overwritten Cadence',
+            'FR（法）': 'Cadence FR'
+          })
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => [] });
+    });
+
+    render(
+      <ToastProvider>
+        <EditTermModal
+          open={true}
+          record={recordWithEn}
+          fieldMap={{ ...fieldMap, 'FR（法）': 'f_fr' }}
+          getRecordValue={getRecordValue}
+          targetLanguages={['EN（英文）', 'FR（法）']}
+          projectRole="editor"
+          onClose={mockOnClose}
+        />
+      </ToastProvider>
+    );
+
+    // 取消勾选"保留已有翻译"
+    const checkbox = screen.getByLabelText('保留已有翻译');
+    expect(checkbox).toBeChecked();
+    fireEvent.click(checkbox);
+    expect(checkbox).not.toBeChecked();
+
+    // 点击重新翻译
+    fireEvent.click(screen.getByText('重新翻译').closest('button'));
+
+    // 验证：英语被覆盖为新结果 "AI Overwritten Cadence"
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('AI Overwritten Cadence')).toBeInTheDocument();
+      expect(screen.queryByDisplayValue('Existing Cadence')).not.toBeInTheDocument();
+    });
+  });
+
   it('viewer 角色不显示"清空翻译/重新翻译"按钮', () => {
     render(
       <ToastProvider>
