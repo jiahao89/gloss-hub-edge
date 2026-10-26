@@ -41,6 +41,8 @@ const allowedOrigins = Array.from(new Set([...defaultOrigins, ...envOrigins]));
 
 // Vercel 预览部署域名 (PR 分支自动生成), 限定本项目前缀
 const VERCEL_PREVIEW_ORIGIN_RE = /^https:\/\/glossa-hub-git-[\w-]+\.vercel\.app$/;
+// EdgeOne Pages 预览/默认域名, 同样限定本项目名前缀; 自定义域名走 CORS_ORIGINS
+const EDGEONE_PREVIEW_ORIGIN_RE = /^https:\/\/glossahub(-[\w-]+)?\.edgeone\.[a-z]+$/;
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -48,7 +50,8 @@ app.use(cors({
     if (
       allowedOrigins.includes(origin) ||
       VERCEL_PREVIEW_ORIGIN_RE.test(origin) ||
-      /^http:\/\/localhost:\d+$/.test(origin) || 
+      EDGEONE_PREVIEW_ORIGIN_RE.test(origin) ||
+      /^http:\/\/localhost:\d+$/.test(origin) ||
       /^http:\/\/127\.0\.0\.1:\d+$/.test(origin)
     ) {
       return callback(null, true);
@@ -58,8 +61,10 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+// 6MB: 与 EdgeOne Cloud Functions 的平台级请求体上限对齐 (此前 10mb,
+// 超限时平台会直接掐断连接, 应用层无感知也无法给出友好报错)
+app.use(express.json({ limit: '6mb' }));
+app.use(express.urlencoded({ limit: '6mb', extended: true }));
 
 // 挂载 /api/health （置于 DB 初始化中间件之前，方便探针无视 DB 状态获取健康指标）
 app.use('/api', healthRoutes);
@@ -92,9 +97,10 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api', recycleBinRoutes);
 app.use('/api/logs', logRoutes);
 
-// Start Server (only when NOT running in Vercel Serverless Environment)
+// Start Server (only when NOT running in a Serverless environment:
+// Vercel / EdgeOne Cloud Functions / 测试环境只导出 app 实例, 不监听端口)
 let server = null;
-if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
+if (!process.env.VERCEL && !process.env.EDGEONE_FUNCTION && process.env.NODE_ENV !== 'test') {
   const startServer = () => {
     if (!server) {
       server = app.listen(PORT, () => {

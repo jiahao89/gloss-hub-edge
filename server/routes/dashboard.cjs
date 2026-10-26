@@ -8,8 +8,8 @@ router.get('/stats', authenticateToken, async (req, res) => {
   try {
     // 前端当前未传 projectId，保持 'proj-default' 兜底；后续多项目看板可通过 ?projectId=xxx 指定
     const projectId = req.query.projectId || 'proj-default';
-    // 行数上限保护：避免超大库把全部 terms 载入内存做 JS 统计
-    const TERM_STATS_LIMIT = 50000;
+    const dbType = getDbType();
+    const isPg = dbType === 'postgres';
 
     const languages = await db.query(
       'SELECT lang_name FROM languages WHERE project_id = $1 ORDER BY display_order ASC',
@@ -18,28 +18,86 @@ router.get('/stats', authenticateToken, async (req, res) => {
     const langNames = languages.map(l => l.lang_name);
     const langCount = langNames.length || 1;
 
-    const versions = await db.query("SELECT id, version_name FROM versions WHERE project_id = $1", [projectId]);
-    const termsRaw = await db.query(
-      `SELECT t.id, t.version_id, t.translations, t.status FROM terms t
-       JOIN versions v ON t.version_id = v.id
-       WHERE v.project_id = $1
-       LIMIT $2`,
-      [projectId, TERM_STATS_LIMIT + 1]
-    );
-    const truncated = termsRaw.length > TERM_STATS_LIMIT;
-    const terms = truncated ? termsRaw.slice(0, TERM_STATS_LIMIT) : termsRaw;
+    // 聚合下推：旧实现把最多 5 万行 terms（含 translations JSON）拉进 Node 内存做
+    // JS 统计，且前端每 10s 轮询本接口，单次请求 CPU/内存开销随库容线性增长。
+    // 现在统计全部下推到数据库（jsonb_each_text / json_each）并行执行。
+    // $N 占位符按本代码库约定统一书写，SQLite 驱动自动转 ?（重复的 $N 需按出现顺序重复传参）。
+    const jsonEachFn = isPg ? 'jsonb_each_text' : 'json_each';
+    const translationsExpr = isPg ? 'p.translations' : "CASE WHEN json_valid(p.translations) THEN p.translations ELSE '{}' END";
 
-    const versionCount = versions.length;
-    const termCount = terms.length;
-    const totalCells = termCount * langCount;
-    let filledCells = 0;
-    let fullyTranslatedCount = 0;
+    let langCond;
+    let langFilterParams = [];
+    if (langNames.length > 0) {
+      if (isPg) {
+        langCond = 'je.key = ANY($2)';
+        langFilterParams = [langNames];
+      } else {
+        langCond = `je.key IN (${langNames.map((_, i) => `$${i + 2}`).join(',')})`;
+        langFilterParams = [...langNames];
+      }
+    } else {
+      langCond = '1 = 0';
+    }
+
+    const projTermsCte = `
+      WITH proj_terms AS (
+        SELECT t.id, t.version_id, t.translations, t.status
+        FROM terms t
+        JOIN versions v ON t.version_id = v.id
+        WHERE v.project_id = $1
+      )`;
+
+    // 查询 1: 每版本词条数 / 全翻译词条数 / 填充单元格数 / 已审核词条数
+    // 用相关标量子查询计算每条词条的填充数（不依赖 id JOIN：SQLite 的 TEXT
+    // PRIMARY KEY 允许 NULL，遗留 NULL id 行会让 LEFT JOIN 漏计）
+    const perVersionSql = `${projTermsCte},
+      per_term AS (
+        SELECT p.version_id, p.status,
+          (SELECT COUNT(*) FROM ${isPg ? 'LATERAL ' : ''}${jsonEachFn}(${translationsExpr}) je
+           WHERE TRIM(je.value) <> '' AND ${langCond}) AS filled_cnt
+        FROM proj_terms p
+      )
+      SELECT
+        version_id,
+        COUNT(*) AS total_terms,
+        COALESCE(SUM(CASE WHEN filled_cnt >= $3 THEN 1 ELSE 0 END), 0) AS fully_translated,
+        COALESCE(SUM(filled_cnt), 0) AS filled_cells,
+        COALESCE(SUM(CASE WHEN status IN ('APPROVED', 'PUBLISHED') THEN 1 ELSE 0 END), 0) AS reviewed_terms
+      FROM per_term
+      GROUP BY version_id`;
+
+    // 查询 2: 每语种填充单元格数（langFilledMap）
+    const langFilledSql = `${projTermsCte}
+      SELECT je.key AS lang, COUNT(*) AS filled
+      FROM proj_terms p, ${isPg ? 'LATERAL ' : ''}${jsonEachFn}(${translationsExpr}) je
+      WHERE TRIM(je.value) <> '' AND ${langCond}
+      GROUP BY je.key`;
+
+    const recentLogsRaw = await db.query(
+      `SELECT l.*, u.name AS operator_name FROM ${dbType === 'postgres' ? 'logs' : 'logs_v2'} l
+       LEFT JOIN users u ON l.user_id = u.id
+       ORDER BY l.id DESC LIMIT 5`
+    );
+
+    const [versions, perVersionRows, langFilledRows] = await Promise.all([
+      db.query('SELECT id, version_name FROM versions WHERE project_id = $1', [projectId]),
+      db.query(perVersionSql, isPg ? [projectId, langNames, langCount] : [projectId, ...langNames, langCount]),
+      db.query(langFilledSql, [projectId, ...langFilterParams])
+    ]);
 
     const langFilledMap = {};
     langNames.forEach(l => { langFilledMap[l] = 0; });
+    for (const r of langFilledRows) {
+      if (Object.prototype.hasOwnProperty.call(langFilledMap, r.lang)) {
+        langFilledMap[r.lang] = parseInt(r.filled, 10) || 0;
+      }
+    }
+    const filledCells = Object.values(langFilledMap).reduce((a, b) => a + b, 0);
 
-    const langReviewedMap = {};
-    langNames.forEach(l => { langReviewedMap[l] = 0; });
+    const versionCount = versions.length;
+
+    let termCount = 0;
+    let fullyTranslatedCount = 0;
     let reviewedTerms = 0;
 
     const versionStatsMap = {};
@@ -47,32 +105,20 @@ router.get('/stats', authenticateToken, async (req, res) => {
       versionStatsMap[v.id] = { id: v.id, name: v.version_name, totalTerms: 0, filledCells: 0, fullyTranslatedTerms: 0 };
     });
 
-    for (const t of terms) {
-      let trans = {};
-      try { trans = typeof t.translations === 'string' ? JSON.parse(t.translations || '{}') : (t.translations || {}); } catch { trans = {}; }
+    for (const row of perVersionRows) {
+      const total = parseInt(row.total_terms, 10) || 0;
+      const fully = parseInt(row.fully_translated, 10) || 0;
+      const filled = parseInt(row.filled_cells, 10) || 0;
+      const reviewed = parseInt(row.reviewed_terms, 10) || 0;
+      termCount += total;
+      fullyTranslatedCount += fully;
+      reviewedTerms += reviewed;
 
-      let termFilledCount = 0;
-      for (const lang of langNames) {
-        const val = trans[lang];
-        if (val && val.toString().trim() !== '') { filledCells++; termFilledCount++; langFilledMap[lang]++; }
-      }
-
-      const isReviewed = t.status === 'APPROVED' || t.status === 'PUBLISHED';
-      if (isReviewed) {
-        reviewedTerms++;
-        for (const lang of langNames) {
-          langReviewedMap[lang]++;
-        }
-      }
-
-      const isFull = termFilledCount === langCount && langCount > 0;
-      if (isFull) fullyTranslatedCount++;
-
-      const vStat = versionStatsMap[t.version_id];
+      const vStat = versionStatsMap[row.version_id];
       if (vStat) {
-        vStat.totalTerms++;
-        vStat.filledCells += termFilledCount;
-        if (isFull) vStat.fullyTranslatedTerms++;
+        vStat.totalTerms = total;
+        vStat.filledCells = filled;
+        vStat.fullyTranslatedTerms = fully;
       }
     }
 
@@ -82,6 +128,11 @@ router.get('/stats', authenticateToken, async (req, res) => {
       return { id: vStat.id, name: vStat.name, totalTerms: vStat.totalTerms, fullyTranslatedTerms: vStat.fullyTranslatedTerms, progress };
     });
 
+    // 与旧 JS 实现口径一致: 每个已审核词条为全部语种各 +1（与该语种是否填翻译无关）
+    const langReviewedMap = {};
+    langNames.forEach(l => { langReviewedMap[l] = reviewedTerms; });
+
+    const totalCells = termCount * langCount;
     const globalCoverage = totalCells > 0 ? Math.round((filledCells / totalCells) * 100) : 0;
 
     const langProgress = langNames.map(l => ({
@@ -98,14 +149,6 @@ router.get('/stats', authenticateToken, async (req, res) => {
       coverage: termCount > 0 ? Math.round((langReviewedMap[l] / termCount) * 100) : 0
     }));
     const reviewCoverage = termCount > 0 ? Math.round((reviewedTerms / termCount) * 100) : 0;
-
-    const dbType = getDbType();
-    const logsTable = dbType === 'postgres' ? 'logs' : 'logs_v2';
-    const recentLogsRaw = await db.query(
-      `SELECT l.*, u.name AS operator_name FROM ${logsTable} l
-       LEFT JOIN users u ON l.user_id = u.id
-       ORDER BY l.id DESC LIMIT 5`
-    );
 
     const recentLogs = recentLogsRaw.map(r => ({
       id: r.id,
@@ -135,7 +178,8 @@ router.get('/stats', authenticateToken, async (req, res) => {
       reviewedTermCount: reviewedTerms,
       reviewCoverage,
       recentLogs,
-      truncated
+      // 统计已下推数据库，不再有 5 万行截断保护
+      truncated: false
     });
   } catch (err) {
     console.error('获取看板统计数据失败:', err);

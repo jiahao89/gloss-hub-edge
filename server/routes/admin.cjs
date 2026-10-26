@@ -25,7 +25,7 @@ router.post('/users', authenticateToken, requireSystemAdmin, async (req, res) =>
     if (existing) {
       return res.status(409).json({ error: '用户名已存在' });
     }
-    const hashedPwd = hashPassword(password);
+    const hashedPwd = await hashPassword(password);
     const userId = crypto.randomUUID();
     const targetRole = role === 'admin' ? 'admin' : 'user';
     // PG 列定义里有 DEFAULT NOW()，让它自动填充，避免传 JS Date 对象导致时区信息丢失。
@@ -63,7 +63,7 @@ router.put('/users/:id', authenticateToken, requireSystemAdmin, async (req, res)
     const targetRole = role === 'admin' ? 'admin' : 'user';
 
     if (password && password.trim() !== '') {
-      const hashedPwd = hashPassword(password);
+      const hashedPwd = await hashPassword(password);
       await db.run(
         'UPDATE users SET name = $1, role = $2, password_hash = $3 WHERE id = $4',
         [name, targetRole, hashedPwd, id]

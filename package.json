@@ -1,7 +1,7 @@
 {
   "name": "glossahub",
   "private": true,
-  "version": "0.2.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,7 +16,6 @@
     "test:e2e": "node e2e/e2e-runner.cjs"
   },
   "dependencies": {
-    "@heroui/react": "^3.2.1",
     "@heroui/styles": "^3.2.1",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
@@ -30,8 +29,7 @@
     "pg-connection-string": "^2.14.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "sqlite3": "^5.1.7",
-    "tailwindcss": "^4.3.2"
+    "sqlite3": "^5.1.7"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.2",
@@ -44,6 +42,7 @@
     "oxlint": "^1.69.0",
     "playwright": "^1.61.1",
     "supertest": "^7.2.2",
+    "tailwindcss": "^4.3.2",
     "vite": "^8.1.0",
     "vitest": "^4.1.9"
   }

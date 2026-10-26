@@ -41,3 +41,8 @@ videos/
 
 glossahub.db-shm
 glossahub.db-wal
+__pycache__/
+
+# EdgeOne CLI 本地构建产物与工具状态
+.edgeone/
+.zcode/

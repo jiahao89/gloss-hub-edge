@@ -101,7 +101,8 @@ export default function BatchGenerateKwModal({
         const res = await apiFetch(`/api/projects/${projectId}/batch-generate-kw`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: payload })
+          body: JSON.stringify({ items: payload }),
+        timeoutMs: 115000,
         });
 
         if (res.ok) {
@@ -155,7 +156,8 @@ export default function BatchGenerateKwModal({
         body: JSON.stringify({
           updates,
           overwrite: mode === 'all'
-        })
+        }),
+      timeoutMs: 115000,
       });
 
       if (!res.ok) {

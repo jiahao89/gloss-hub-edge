@@ -42,12 +42,14 @@ describe('apiFetch', () => {
 
     await apiFetch('/api/data');
 
-    expect(mockFetch).toHaveBeenCalledWith('/api/data', {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer my-jwt-token',
-      },
+    const [calledUrl, calledOpts] = mockFetch.mock.calls[0];
+    expect(calledUrl).toBe('/api/data');
+    expect(calledOpts.headers).toEqual({
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer my-jwt-token',
     });
+    // 每个请求都带 AbortController 超时信号
+    expect(calledOpts.signal).toBeInstanceOf(AbortSignal);
   });
 
   it('当 localStorage 中无 token 时，不附带 Authorization 头', async () => {
@@ -157,5 +159,34 @@ describe('apiFetch', () => {
     const callOpts = mockFetch.mock.calls[0][1];
     expect(callOpts.method).toBe('POST');
     expect(callOpts.body).toBe(body);
+  });
+
+  it('GET 请求网络失败时自动重试一次', async () => {
+    localStorageMock.getItem.mockReturnValue(null);
+    mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    mockFetch.mockResolvedValueOnce({ status: 200 });
+
+    const res = await apiFetch('/api/data');
+
+    expect(res.status).toBe(200);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('POST 请求网络失败时不重试（防止重复提交）', async () => {
+    localStorageMock.getItem.mockReturnValue(null);
+    mockFetch.mockRejectedValue(new TypeError('Failed to fetch'));
+
+    await expect(apiFetch('/api/save', { method: 'POST' })).rejects.toThrow('网络请求失败');
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('调用方可通过 timeoutMs 覆盖默认超时', async () => {
+    localStorageMock.getItem.mockReturnValue(null);
+    mockFetch.mockResolvedValue({ status: 200 });
+
+    await apiFetch('/api/ai-translate', { method: 'POST', timeoutMs: 110000 });
+
+    // 不抛错且 fetch 正常收到 signal 即可
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

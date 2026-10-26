@@ -364,7 +364,8 @@ export default function TranslationTab({
             res = await apiFetch(`/api/projects/proj-default/ai-translate?debug=1`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ inputs })
+              body: JSON.stringify({ inputs }),
+            timeoutMs: 110000,
             });
             if (res.ok) {
               lastErr = null;
@@ -976,7 +977,8 @@ export default function TranslationTab({
         body: JSON.stringify({
           modifiedCells,
           highlightIds: Object.keys(modifiedCells || {})
-        })
+        }),
+      timeoutMs: 120000,
       });
       if (res.ok) {
         const blob = await res.blob();

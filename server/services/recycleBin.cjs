@@ -73,6 +73,35 @@ async function backupToRecycleBin(entityType, entityId, entityName, userId) {
   }
 }
 
+// 批量写入 recycle_bin（多行 VALUES 单条 INSERT）。
+// executor 传入事务执行器（tx）可保证备份与硬删同事务原子提交。
+// rows: [{ id, entityType, entityName, payloadJson }]
+async function bulkInsertToRecycleBin(executor, rows, userId) {
+  if (!rows || rows.length === 0) return;
+  const dbType = getDbType();
+
+  const deletedAt = dbType === 'postgres' ? new Date() : new Date().toISOString();
+  const expiresAtDate = new Date();
+  expiresAtDate.setDate(expiresAtDate.getDate() + 30);
+  const expiresAt = dbType === 'postgres' ? expiresAtDate : expiresAtDate.toISOString();
+
+  const valuesClauses = [];
+  const params = [];
+  rows.forEach((row, i) => {
+    const b = i * 7;
+    const payloadPh = dbType === 'postgres' ? `$${b + 4}::jsonb` : `$${b + 4}`;
+    valuesClauses.push(`($${b + 1}, $${b + 2}, $${b + 3}, ${payloadPh}, $${b + 5}, $${b + 6}, $${b + 7})`);
+    params.push(row.id, row.entityType, row.entityName, row.payloadJson, userId, deletedAt, expiresAt);
+  });
+
+  await executor.run(
+    `INSERT INTO recycle_bin (id, entity_type, entity_name, payload, deleted_by, deleted_at, expires_at)
+     VALUES ${valuesClauses.join(', ')}`,
+    params
+  );
+}
+
 module.exports = {
-  backupToRecycleBin
+  backupToRecycleBin,
+  bulkInsertToRecycleBin
 };

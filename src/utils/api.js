@@ -9,24 +9,51 @@
  */
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
+// 请求超时（毫秒）：普通请求 30s；长耗时请求（AI 翻译等）由调用方传
+// options.timeoutMs 覆盖（后端 Dify 故障转移链最长约 100s）。
+const DEFAULT_TIMEOUT_MS = 30000;
+
 export async function apiFetch(url, options = {}) {
   const token = localStorage.getItem('token');
-  
+  const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const method = (options.method || 'GET').toUpperCase();
+
+  // 幂等 GET 网络失败自动重试一次（网络抖动/后端唤醒瞬间）;
+  // 写操作一律不重试, 防止重复提交。
+  const maxAttempts = method === 'GET' ? 2 : 1;
+
   let res;
-  try {
-    res = await fetch(`${API_BASE}${url}`, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...options.headers,
-      },
-    });
-  } catch (err) {
-    if (err.message === 'Failed to fetch') {
-      throw new Error('网络请求失败：后端服务可能正在唤醒中（约需 50 秒），请稍后刷新重试。');
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // AbortController 实现请求超时, 避免后端不可达时请求永久挂起
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      res = await fetch(`${API_BASE}${url}`, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...options.headers,
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      break;
+    } catch (err) {
+      clearTimeout(timer);
+      const isTimeout = err.name === 'AbortError' || err.name === 'TimeoutError';
+      if (attempt < maxAttempts && (isTimeout || err.message === 'Failed to fetch')) {
+        await new Promise((r) => setTimeout(r, 800));
+        continue;
+      }
+      if (err.message === 'Failed to fetch') {
+        throw new Error('网络请求失败：后端服务可能正在唤醒中（约需 50 秒），请稍后刷新重试。');
+      }
+      if (isTimeout) {
+        throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒），请稍后重试。`);
+      }
+      throw err;
     }
-    throw err;
   }
 
   // 401: 仅当是当前用户的会话失效时才跳登录。

@@ -20,18 +20,18 @@ function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
-// bcrypt hashing helper (new standard)
+// bcrypt hashing helper (new standard) — 异步执行，避免 ~100ms CPU 哈希阻塞事件循环
 const bcrypt = require('bcryptjs');
 const BCRYPT_ROUNDS = 10;
-function hashPassword(plain) {
-  return bcrypt.hashSync(plain, BCRYPT_ROUNDS);
+async function hashPassword(plain) {
+  return bcrypt.hash(plain, BCRYPT_ROUNDS);
 }
-function verifyPassword(plain, hash) {
+async function verifyPassword(plain, hash) {
   // 兼容旧 SHA256 哈希（64 位 hex = SHA256）
-  if (hash.length === 64) {
+  if (hash && hash.length === 64) {
     return sha256(plain) === hash;
   }
-  return bcrypt.compareSync(plain, hash);
+  return bcrypt.compare(plain, hash);
 }
 
 // 创建关键索引以加速常用查询（SQLite 与 Postgres 均需执行，索引语句语法两库通用，无 SQLite 专有写法）
@@ -63,6 +63,17 @@ async function ensureIndexes() {
 }
 
 async function initSqliteTables() {
+  // 种子用户哈希预生成（异步 bcrypt，不阻塞事件循环）
+  const adminPassword = process.env.INITIAL_ADMIN_PASSWORD || 'magene123';
+  if (process.env.NODE_ENV === 'production' && adminPassword === 'magene123') {
+    console.warn('🚨🚨 安全警告: 生产环境仍在使用默认管理员种子密码 (magene123)，请立即通过 INITIAL_ADMIN_PASSWORD 环境变量修改！ 🚨🚨');
+  }
+  const [passHash, userHash, viewerHash] = await Promise.all([
+    hashPassword(adminPassword),
+    hashPassword('user123'),
+    hashPassword('viewer123')
+  ]);
+
   return new Promise((resolve, _reject) => {
     sqliteDb.serialize(() => {
       // 1. users
@@ -181,13 +192,6 @@ async function initSqliteTables() {
       `);
 
       // Pre-populate users
-      const adminPassword = process.env.INITIAL_ADMIN_PASSWORD || 'magene123';
-      if (process.env.NODE_ENV === 'production' && adminPassword === 'magene123') {
-        console.warn('🚨🚨 安全警告: 生产环境仍在使用默认管理员种子密码 (magene123)，请立即通过 INITIAL_ADMIN_PASSWORD 环境变量修改！ 🚨🚨');
-      }
-      const passHash = hashPassword(adminPassword);
-      const userHash = hashPassword('user123');
-      const viewerHash = hashPassword('viewer123');
       sqliteDb.run(`
         INSERT OR IGNORE INTO users (id, username, password_hash, name, role, created_at)
         VALUES 
@@ -393,7 +397,7 @@ async function initDatabase() {
         const primaryPool = new Pool({
           connectionString: pgUrl,
           ssl: sslConfig,
-          max: 5,
+          max: 10,
           idleTimeoutMillis: 30000,
           connectionTimeoutMillis: 8000
         });
@@ -435,7 +439,7 @@ async function initDatabase() {
 
         const servername = pgConfig.host || undefined;
         pgConfig.ssl = isSupabase ? { rejectUnauthorized: false, servername } : false;
-        pgConfig.max = 5;
+        pgConfig.max = 10;
         pgConfig.idleTimeoutMillis = 30000;
         pgConfig.connectionTimeoutMillis = 10000;
 
@@ -720,6 +724,16 @@ function ensureDbInit() {
   return dbInitPromise;
 }
 
+// SQLite 共用单连接: 并发事务的 BEGIN/COMMIT 会在共享连接上交错执行,
+// 第一个 COMMIT 会提前终结另一个请求的事务。用 promise 链把事务区间串行化,
+// 保证同一时刻只有一个事务在打开状态（本地开发路径）。
+let sqliteTxTail = Promise.resolve();
+function runSerializedSqliteTx(task) {
+  const exec = sqliteTxTail.then(task, task);
+  sqliteTxTail = exec.then(() => undefined, () => undefined);
+  return exec;
+}
+
 // 统一 SQL 驱动接口
 const db = {
   async query(sql, params = []) {
@@ -783,17 +797,19 @@ const db = {
         client.release();
       }
     } else {
-      await this.run('BEGIN TRANSACTION');
-      try {
-        const result = await callback(this);
-        await this.run('COMMIT');
-        return result;
-      } catch (e) {
+      return runSerializedSqliteTx(async () => {
+        await this.run('BEGIN TRANSACTION');
         try {
-          await this.run('ROLLBACK');
-        } catch { }
-        throw e;
-      }
+          const result = await callback(this);
+          await this.run('COMMIT');
+          return result;
+        } catch (e) {
+          try {
+            await this.run('ROLLBACK');
+          } catch { }
+          throw e;
+        }
+      });
     }
   }
 };

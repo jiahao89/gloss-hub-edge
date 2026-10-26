@@ -19,17 +19,17 @@ router.post('/login', loginLimiter, async (req, res) => {
     const user = await db.queryOne('SELECT * FROM users WHERE username = $1', [username]);
     if (!user) {
       // 与"用户存在但密码错误"路径保持等耗时
-      bcrypt.compareSync(password, DUMMY_PASSWORD_HASH);
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({ error: '用户名或密码不正确！' });
     }
 
-    if (!verifyPassword(password, user.password_hash)) {
+    if (!(await verifyPassword(password, user.password_hash))) {
       return res.status(401).json({ error: '用户名或密码不正确！' });
     }
 
     // 自动升级旧 SHA256 哈希为 bcrypt
     if (user.password_hash.length === 64) {
-      const newHash = hashPassword(password);
+      const newHash = await hashPassword(password);
       await db.run('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);
     }
 

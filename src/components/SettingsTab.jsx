@@ -130,7 +130,8 @@ export default function SettingsTab({
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ baseUrl: dififyUrlClean(difyUrl), apiKey: difyKey && difyKey !== BUILTIN_KEY_PLACEHOLDER ? difyKey : undefined })
+        body: JSON.stringify({ baseUrl: dififyUrlClean(difyUrl), apiKey: difyKey && difyKey !== BUILTIN_KEY_PLACEHOLDER ? difyKey : undefined }),
+      timeoutMs: 100000,
       });
       const data = await res.json();
       setTesting(false);

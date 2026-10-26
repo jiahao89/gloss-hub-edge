@@ -12,29 +12,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping GlossaHub Health Check
+        env:
+          # 主入口: EdgeOne Pages 全栈部署 (前端 + /api Cloud Functions, 无休眠问题)。
+          # 可在仓库 Settings → Variables → Actions 中配置 EDGEONE_HEALTH_URL 覆盖默认值。
+          EDGEONE_HEALTH_URL: ${{ vars.EDGEONE_HEALTH_URL || 'https://glossahub.edgeone.app/api/health' }}
+          # 过渡期备用入口: Render 后端 (回退通道; Render 下线后删除本变量与对应探测)。
+          RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL || 'https://glossa-hub.onrender.com/api/health' }}
         run: |
-          echo "Sending keep-alive heartbeat to GlossaHub backend..."
-          URL="https://glossa-hub.onrender.com/api/health"
-          
-          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 60 "$URL" || true)
-          echo "$RESPONSE"
-          STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d':' -f2)
+          ping_url() {
+            local url="$1"
+            curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 60 -L "$url" || true
+          }
 
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ Heartbeat successful. Database is active and responsive."
-          elif [ "$STATUS" = "503" ]; then
-            echo "⚠️ Backend responded with 503 (database waking up / cold start). Waiting 30s for recovery..."
+          echo "Pinging EdgeOne: $EDGEONE_HEALTH_URL"
+          R1=$(ping_url "$EDGEONE_HEALTH_URL")
+          S1=$(echo "$R1" | grep "HTTP_STATUS" | cut -d':' -f2)
+          echo "$R1"
+
+          echo "Pinging Render (fallback): $RENDER_HEALTH_URL"
+          R2=$(ping_url "$RENDER_HEALTH_URL")
+          S2=$(echo "$R2" | grep "HTTP_STATUS" | cut -d':' -f2)
+          echo "$R2"
+
+          # 任一入口返回 200 即表示 /api/health 已执行 SELECT 1,
+          # 足以刷新 Supabase 免费 7 天不活跃休眠倒计时。
+          if [ "$S1" = "200" ] || [ "$S2" = "200" ]; then
+            echo "✅ Heartbeat successful. Database is active and responsive (EdgeOne=$S1, Render=$S2)."
+          elif [ "$S1" = "503" ] || [ "$S2" = "503" ]; then
+            echo "⚠️ 503 (database waking up). Waiting 30s for recovery..."
             sleep 30
-            RETRY_RES=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 60 "$URL" || true)
-            echo "$RETRY_RES"
-            RETRY_STATUS=$(echo "$RETRY_RES" | grep "HTTP_STATUS" | cut -d':' -f2)
-            if [ "$RETRY_STATUS" = "200" ]; then
+            R3=$(ping_url "$EDGEONE_HEALTH_URL")
+            S3=$(echo "$R3" | grep "HTTP_STATUS" | cut -d':' -f2)
+            echo "$R3"
+            if [ "$S3" = "200" ]; then
               echo "✅ Recovery verified: Database successfully connected."
             else
-              echo "❌ Retry returned HTTP $RETRY_STATUS"
+              echo "❌ Retry returned HTTP $S3"
               exit 1
             fi
           else
-            echo "❌ Unexpected response status: $STATUS"
+            echo "❌ Unexpected response status: EdgeOne=$S1, Render=$S2"
             exit 1
           fi

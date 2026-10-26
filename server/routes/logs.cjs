@@ -15,6 +15,31 @@ const ALLOWED_LOG_ACTIONS = [
 // 字符串字段统一截断, 防止超长内容撑爆审计表
 const truncateField = (val, max = 200) => (typeof val === 'string' ? val.slice(0, max) : '');
 
+// 筛选选项缓存: 日志页每次加载都要对 logs 表跑 3 个 DISTINCT 全表扫描
+// (version/operator/action), 而选项集变化频率极低 → 60s 内存缓存。
+const FILTER_OPTIONS_TTL_MS = 60000;
+const filterOptionsCache = new Map(); // logsTable -> { expiresAt, versions, operators, actions }
+
+async function getFilterOptions(logsTable) {
+  const cached = filterOptionsCache.get(logsTable);
+  if (cached && cached.expiresAt > Date.now()) return cached;
+
+  const [versionRows, operatorRows, actionRows] = await Promise.all([
+    db.query(`SELECT DISTINCT l.version_name FROM ${logsTable} l WHERE l.version_name IS NOT NULL AND l.version_name != '' ORDER BY l.version_name`),
+    db.query(`SELECT DISTINCT u.name FROM ${logsTable} l LEFT JOIN users u ON l.user_id = u.id WHERE u.name IS NOT NULL AND u.name != '' ORDER BY u.name`),
+    db.query(`SELECT DISTINCT l.action FROM ${logsTable} l WHERE l.action IS NOT NULL AND l.action != '' ORDER BY l.action`)
+  ]);
+
+  const options = {
+    expiresAt: Date.now() + FILTER_OPTIONS_TTL_MS,
+    versions: versionRows.map(r => r.version_name).filter(Boolean),
+    operators: operatorRows.map(r => r.name).filter(Boolean),
+    actions: actionRows.map(r => r.action).filter(Boolean)
+  };
+  filterOptionsCache.set(logsTable, options);
+  return options;
+}
+
 // GET /api/logs - 获取修改日志（分页 + 服务端筛选）
 router.get('/', authenticateToken, async (req, res) => {
   const dbType = getDbType();
@@ -110,35 +135,25 @@ router.get('/', authenticateToken, async (req, res) => {
       pi += 1;
     }
 
-    // Paginated query
-    const rows = await db.query(
-      `SELECT l.*, u.name AS operator_name FROM ${logsTable} l
-       LEFT JOIN users u ON l.user_id = u.id
-       ${whereClause}
-       ORDER BY l.id DESC
-       LIMIT $${pi} OFFSET $${pi + 1}`,
-      [...params, size, offset]
-    );
-
-    // Count query (reuse WHERE + params, no LIMIT/OFFSET)
-    const countRows = await db.query(
-      `SELECT COUNT(*) as total FROM ${logsTable} l
-       LEFT JOIN users u ON l.user_id = u.id
-       ${whereClause}`,
-      params
-    );
+    // 分页查询与 COUNT 相互独立, 并行执行
+    const [rows, countRows, filterOptions] = await Promise.all([
+      db.query(
+        `SELECT l.*, u.name AS operator_name FROM ${logsTable} l
+         LEFT JOIN users u ON l.user_id = u.id
+         ${whereClause}
+         ORDER BY l.id DESC
+         LIMIT $${pi} OFFSET $${pi + 1}`,
+        [...params, size, offset]
+      ),
+      db.query(
+        `SELECT COUNT(*) as total FROM ${logsTable} l
+         LEFT JOIN users u ON l.user_id = u.id
+         ${whereClause}`,
+        params
+      ),
+      getFilterOptions(logsTable)
+    ]);
     const total = countRows[0]?.total || 0;
-
-    // Filter options (full list, independent of pagination/filters)
-    const versionRows = await db.query(
-      `SELECT DISTINCT l.version_name FROM ${logsTable} l WHERE l.version_name IS NOT NULL AND l.version_name != '' ORDER BY l.version_name`
-    );
-    const operatorRows = await db.query(
-      `SELECT DISTINCT u.name FROM ${logsTable} l LEFT JOIN users u ON l.user_id = u.id WHERE u.name IS NOT NULL AND u.name != '' ORDER BY u.name`
-    );
-    const actionRows = await db.query(
-      `SELECT DISTINCT l.action FROM ${logsTable} l WHERE l.action IS NOT NULL AND l.action != '' ORDER BY l.action`
-    );
 
     const formatted = rows.map(r => ({
       id: r.id,
@@ -157,9 +172,9 @@ router.get('/', authenticateToken, async (req, res) => {
       page: pageNum,
       pageSize: size,
       filters: {
-        versions: versionRows.map(r => r.version_name).filter(Boolean),
-        operators: operatorRows.map(r => r.name).filter(Boolean),
-        actions: actionRows.map(r => r.action).filter(Boolean)
+        versions: filterOptions.versions,
+        operators: filterOptions.operators,
+        actions: filterOptions.actions
       }
     });
   } catch (err) {
@@ -196,6 +211,9 @@ router.post('/', authenticateToken, async (req, res) => {
       [nowStr, kw, chinese, action, details, version, req.user.id]
     );
 
+    // 新日志可能引入新的 operator/action 选项, 失效筛选选项缓存
+    filterOptionsCache.delete(logsTable);
+
     res.status(201).json({
       timestamp: nowStr,
       kw,
@@ -217,6 +235,7 @@ router.delete('/', authenticateToken, requireSystemAdmin, async (_req, res) => {
   try {
     const logsTable = dbType === 'postgres' ? 'logs' : 'logs_v2';
     await db.run(`DELETE FROM ${logsTable}`);
+    filterOptionsCache.delete(logsTable);
     res.json({ message: '修改记录清空成功' });
   } catch (err) {
     console.error('清空日志失败:', err);

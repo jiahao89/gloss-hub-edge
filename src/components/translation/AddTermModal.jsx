@@ -64,6 +64,7 @@ export default function AddTermModal({ open, onClose, selectedTableId, targetLan
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: cn, enText: en, context }),
+      timeoutMs: 45000,
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -129,7 +130,8 @@ export default function AddTermModal({ open, onClose, selectedTableId, targetLan
       const res = await apiFetch(`/api/projects/proj-default/ai-translate?debug=1`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ inputs })
+        body: JSON.stringify({ inputs }),
+      timeoutMs: 110000,
       });
 
       if (!res.ok) {

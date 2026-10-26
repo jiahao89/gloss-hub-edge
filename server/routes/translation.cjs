@@ -40,18 +40,19 @@ function isPrivateOrLocalUrl(urlString) {
 
 const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 GlossaHub/1.1';
 
+// 多候选引擎超时预算（毫秒）: 45+35+20 = 100s 总上限
+const CANDIDATE_TIMEOUT_BUDGET_MS = [45000, 35000, 20000];
+
 // 内置 Dify 引擎 (由运维预配置, 前端无需手动输入 Key)
 // Key 由环境变量 DIFY_BUILTIN_KEYS (逗号分隔) 注入, 顺序:
 //   [0] night.magene.cn → 迈金 Night 专用引擎
 //   [1] api.dify.ai     → Dify 官方云服务
 
 // 从环境变量构建内置引擎 { host: apiKey } 映射
+// 安全: Key 一律来自 DIFY_BUILTIN_KEYS 环境变量（运维注入），源码不保留明文回退值
 function getBuiltinDifyApps() {
   const keys = getBuiltinKeys();
-  const apps = {
-    'night.magene.cn': 'app-zV0Lo78Bi5WjhplWDL7OwsWR',
-    'api.dify.ai': 'app-aochEehgytnJciYeI3L1pqfj'
-  };
+  const apps = {};
 
   if (keys.length > 0) {
     keys.forEach(k => {
@@ -122,6 +123,12 @@ async function executeDifyWithFailover(primaryConfig, inputs, userIdStr) {
 
   const candidates = [primaryConfig, ...builtinCandidates];
 
+  // SSRF 防护: 项目存储的 baseUrl 一律拦截内网/私有地址（dify-test 已有同款检查）
+  if (primaryConfig && primaryConfig.baseUrl && isPrivateOrLocalUrl(primaryConfig.baseUrl)) {
+    console.warn('⚠️ 拦截内网/私有 Dify 地址:', primaryConfig.baseUrl);
+    candidates.splice(0, 1);
+  }
+
   const uniqueCandidates = [];
   const seen = new Set();
 
@@ -151,11 +158,13 @@ async function executeDifyWithFailover(primaryConfig, inputs, userIdStr) {
 
   for (let cIdx = 0; cIdx < uniqueCandidates.length; cIdx++) {
     const item = uniqueCandidates[cIdx];
-    const isPrimary = (cIdx === 0);
-    // 超时时长放宽至 60 秒 (1 分钟)，确保长文本 + 17 语种大模型推理能够完整接收
+    // 超时预算: EdgeOne Cloud Functions 单请求上限 120s（Vercel 60s），
+    // 多候选总耗时必须控制在 ~100s 内，否则代理层会先掐断连接。
+    // 逐候选递减 [45s, 35s, 20s]；近期失败过的引擎直接降到 20s 快速失败。
     const recentFailTime = engineFailureTimestamps.get(item.baseUrl) || 0;
     const isRecentlyFailed = (Date.now() - recentFailTime < 30000);
-    const candidateTimeout = isRecentlyFailed ? 20000 : 60000;
+    const baseTimeout = CANDIDATE_TIMEOUT_BUDGET_MS[cIdx] || 20000;
+    const candidateTimeout = isRecentlyFailed ? Math.min(baseTimeout, 20000) : baseTimeout;
     try {
       const targetUrl = `${item.baseUrl}/workflows/run`;
       const response = await fetch(targetUrl, {
@@ -767,19 +776,30 @@ router.post('/projects/:projectId/batch-generate-kw', authenticateToken, require
   }
 
   try {
-    const results = [];
-    for (const item of items) {
-      const text = item.text || item.zh_cn || '';
-      const enText = item.enText || item.en || '';
-      const context = item.context || '';
-      const kw = await generateKwHelper(projectId, text, enText, context);
-      results.push({
-        id: item.id || item.recordId,
-        text,
-        enText,
-        kw
-      });
-    }
+    // 受控并发（3 个 worker）调用外部 Dify；单条失败不影响整批，
+    // 结果按原始顺序返回（kw 为 null 表示该条生成失败）
+    const GENERATE_CONCURRENCY = 3;
+    const results = new Array(items.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < items.length) {
+        const idx = cursor++;
+        const item = items[idx];
+        const text = item.text || item.zh_cn || '';
+        const enText = item.enText || item.en || '';
+        const context = item.context || '';
+        let kw = null;
+        try {
+          kw = await generateKwHelper(projectId, text, enText, context);
+        } catch (genErr) {
+          console.error(`[batch-generate-kw] 单条生成失败 index=${idx}:`, genErr.message);
+        }
+        results[idx] = { id: item.id || item.recordId, text, enText, kw };
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.max(1, Math.min(GENERATE_CONCURRENCY, items.length)) }, worker)
+    );
     res.json({ results });
   } catch (err) {
     console.error('批量生成 KW 失败:', err);

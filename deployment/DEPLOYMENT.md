@@ -1,13 +1,25 @@
 # GlossaHub 极简云端部署与 AI 协同指南
 
-本指南面向个人项目，介绍如何通过 **Vercel (前端)** + **Render (后端)** + **Supabase (云数据库)** 完成极简部署。同时介绍如何让 AI 助手 (Antigravity) 协助您完成绝大部分的配置与初始化工作，将您的手动配置工作降到最低。
+本指南面向个人项目，介绍如何通过 **EdgeOne Pages (前端 + 后端一体, 推荐)** 或 **Vercel (前端)** + **Render (后端)** + **Supabase (云数据库)** 完成极简部署。同时介绍如何让 AI 助手 (Antigravity) 协助您完成绝大部分的配置与初始化工作，将您的手动配置工作降到最低。
 
 ---
 
 ## 🚀 架构与成本总览 (个人免费方案)
 
+**推荐架构 (EdgeOne 全栈)** —— 前端与后端同站部署，无后端休眠、无冷启动等待：
+
 ```
-用户浏览器 ── CDN ──> Vercel (静态托管, ¥0)
+用户浏览器 ── CDN (国内/全球边缘节点) ──> 腾讯云 EdgeOne Pages
+              ├── 静态资源 (Vite 构建产物 dist/, ¥0)
+              └── /api/* → Cloud Functions (Node.js 运行现有 Express, ¥0)
+                              ↓ (TCP 6543 Pooler)
+                          Supabase (PostgreSQL 数据库, ¥0)
+```
+
+**过渡架构 (Vercel + Render)** —— 保留为回退通道，Render 免费版 15 分钟无活动休眠、冷启动约 50 秒：
+
+```
+用户浏览器 ── CDN ──> Vercel (静态托管 + /api 反向代理, ¥0)
                            ↓ (HTTP)
                        Render (Express API 后端, ¥0, 15min无活动休眠)
                            ↓ (TCP 6543 Pooler)
@@ -85,6 +97,59 @@
 
 ---
 
+## ⚡ 推荐方案：EdgeOne Pages 全栈部署 (前端 + 后端一体)
+
+腾讯云 EdgeOne Pages 通过 **Cloud Functions (Node.js 运行时)** 直接承载现有 Express 应用，前端静态资源与 `/api/*` 同站，彻底消除 Render 免费版的休眠/冷启动问题。
+
+### 已完成的仓库适配
+
+| 适配项 | 说明 |
+| :--- | :--- |
+| `cloud-functions/api/[[default]].js` | 函数入口：catch-all 承接全部 `/api/*`，交给现有 Express 应用 |
+| `server/edgeone-entry.cjs` | 设置 `EDGEONE_FUNCTION=1` 标记，函数环境不监听端口、只导出实例 |
+| `edgeone.json` | 构建 `npm run build` → `dist`；`cloudFunctions.nodejs.maxDuration: 120`；SPA 回退 rewrite |
+| 请求体上限 | `express.json` 已从 10MB 收紧到 6MB（EdgeOne 平台硬限制，超限会被平台掐断） |
+| AI 翻译超时预算 | Dify 多引擎故障转移总时长已从最坏 140s 收紧到 ~100s（120s 上限内留余量） |
+| CORS | 已放行 `glossahub-*.edgeone.*` 预览域名；自定义域名通过 `CORS_ORIGINS` 配置 |
+
+### 部署步骤 (CLI)
+
+1. 安装并登录 CLI（二选一站点：**中国站** 国内加速、自定义域名需 ICP 备案；**全球站** 免备案）：
+   ```bash
+   npm install -g edgeone@latest   # 版本需 ≥ 1.2.30
+   edgeone login --site china      # 或 --site global
+   ```
+2. 在项目根目录执行部署（首次会自动创建项目并生成 `edgeone.json` 关联）：
+   ```bash
+   edgeone pages deploy -n glossahub
+   ```
+3. 在 EdgeOne 控制台 (**Pages → 项目 → 环境变量**) 配置以下环境变量（与 Render 相同）：
+
+   | 键 (Key) | 值 (Value) |
+   | :--- | :--- |
+   | `DATABASE_URL` | Supabase 6543 Pooler 连接串（同第一步） |
+   | `JWT_SECRET` | 强随机字符串 |
+   | `INITIAL_ADMIN_PASSWORD` | 初始管理员密码 |
+   | `DIFY_BUILTIN_KEYS` | 逗号分隔内置引擎 Key（[0]=night.magene.cn, [1]=api.dify.ai） |
+   | `CORS_ORIGINS` | （同站部署时通常可省略；走自定义域名跨域时填写） |
+   | `NODE_ENV` | `production` |
+
+   > 前端 `VITE_API_BASE_URL` **留空**：同站部署时前端走同源相对路径 `/api/*`，无需跨域。
+4. 部署完成后验证：访问 `/api/health` 应返回 `{"status":"ok","dbType":"postgres"}`，前端登录后走一次 AI 翻译确认引擎连通。
+
+### 与 Render/Vercel 的关系 (回退通道)
+
+* 迁移期间 **保留** `api/index.js` + `vercel.json` + Render 服务不动：EdgeOne 异常时可随时切回（蓝图文档中的 3 分钟回滚 runbook）。
+* Render 下线后，`.github/workflows/keepalive.yml` 仍会 ping `/api/health`（保 Supabase 7 天不活跃休眠），可通过仓库 Variables `EDGEONE_HEALTH_URL` 指向 EdgeOne 实际域名，并删除 `RENDER_HEALTH_URL`。
+
+### 平台限制备忘
+
+* Cloud Functions 单请求最长 **120 秒**（`edgeone.json` 已配置）；请求体上限 **6MB**（已对齐）。超大 CSV 建议分批导入。
+* Serverless 环境无持久本地磁盘：SQLite 仅限本地开发（生产必须配置 `DATABASE_URL`，后端已有 Fail-Fast 守卫）。
+* 内存态数据（限流计数、词库缓存、引擎偏好）随函数实例存在，多实例扩容时以单实例语义为准。
+
+---
+
 ## 📝 极简运维与高可用防范
 
 系统上线后，您在 Supabase 的数据将保持 100% 持久化。
@@ -98,5 +163,5 @@
    * 后端会返回明确的 HTTP 503 状态码（提示“云端数据库正在从休眠中唤醒”），前端捕获后会展示友好的等待提示，避免产生“数据被清空”的误解。
 4. **管理员测试账号**：一旦就绪，您可以使用内置的超级管理员账号直接登录进行测试：
    * **用户名**：`jiahao`
-   * **密码**：`magene123`
+   * **密码**：见团队密码管理器（生产环境由 `INITIAL_ADMIN_PASSWORD` 环境变量注入，不落入仓库）
 

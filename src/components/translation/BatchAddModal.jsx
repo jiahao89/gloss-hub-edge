@@ -179,7 +179,8 @@ export default function BatchAddModal({ open, onClose, selectedTableId, onAddSuc
               res = await apiFetch(`/api/projects/proj-default/ai-translate?debug=1`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ inputs })
+                body: JSON.stringify({ inputs }),
+              timeoutMs: 110000,
               });
               if (res.ok) {
                 lastErr = null;

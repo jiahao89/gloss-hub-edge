@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, getDbType } = require('../config/db.cjs');
 const { authenticateToken, requireProjectMember, requireRole } = require('../middleware/auth.cjs');
 const { createAuditLog } = require('../services/auditLogger.cjs');
+const { invalidateGlossaryCache } = require('../services/glossaryCache.cjs');
 
 // GET /api/projects/:projectId/recycle-bin - 获取回收站数据列表
 router.get('/projects/:projectId/recycle-bin', authenticateToken, requireProjectMember, requireRole(['owner']), async (req, res) => {
@@ -259,6 +260,12 @@ router.post('/recycle-bin/:id/restore', authenticateToken, async (req, res) => {
         tx
       });
     });
+
+    // 词库表恢复会改写 glossary_terms, 必须失效词库缓存
+    // (否则 AI 翻译最长 60s 内仍在用恢复前的旧词库)
+    if (item.entity_type === 'glossary_table') {
+      invalidateGlossaryCache(projectId);
+    }
 
     res.json({ message: '数据已成功一键恢复！' });
   } catch (err) {

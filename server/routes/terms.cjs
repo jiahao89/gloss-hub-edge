@@ -4,7 +4,7 @@ const router = express.Router();
 const { db, getDbType } = require('../config/db.cjs');
 const { authenticateToken, requireTermOwnership, requireVersionOwnership } = require('../middleware/auth.cjs');
 const { writeLimiter } = require('../middleware/rateLimiters.cjs');
-const { backupToRecycleBin } = require('../services/recycleBin.cjs');
+const { bulkInsertToRecycleBin } = require('../services/recycleBin.cjs');
 const { parseJsonField } = require('../utils/jsonFields.cjs');
 const { TARGET_LANGUAGES, LEGACY_TO_NEW_LANG_MAP } = require('../config/constants.cjs');
 const { createAuditLog } = require('../services/auditLogger.cjs');
@@ -129,12 +129,14 @@ router.get('/tables/:tableId/records', authenticateToken, async (req, res) => {
 
     const countQuery = `SELECT COUNT(*) as total FROM terms ${whereClause}`;
     const dataQuery = `SELECT * FROM terms ${whereClause} ${orderByClause} LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-    
-    const countResult = await db.queryOne(countQuery, queryParams);
-    const total = parseInt(countResult?.total || 0, 10);
-    
+
+    // COUNT 与分页数据查询相互独立, 并行执行（各省一次串行往返）
     const dataParams = [...queryParams, pageSize, (page - 1) * pageSize];
-    const terms = await db.query(dataQuery, dataParams);
+    const [countResult, terms] = await Promise.all([
+      db.queryOne(countQuery, queryParams),
+      db.query(dataQuery, dataParams)
+    ]);
+    const total = parseInt(countResult?.total || 0, 10);
 
     const formatted = terms.map(term => {
       const trans = parseJsonField(term.translations);
@@ -332,7 +334,7 @@ router.put('/terms/:termId', authenticateToken, async (req, res) => {
         return await tx.run(
           `UPDATE terms
            SET kw = $1, context = $2, owner = $3, zh_cn = $4, translations = $5, translations_meta = $6, status = $7, reject_reason = NULL, updated_at = $8, updated_by = $9
-           WHERE id = $10 AND updated_at = $11 AND is_locked != 1`,
+           WHERE id = $10 AND datetime(updated_at) = datetime($11) AND is_locked != 1`,
           [finalKw, finalContext, finalOwner, finalZhCn, updatedTrans, JSON.stringify(translationsMeta || {}), nextStatus, nowIso, req.user.id, termId, oldUpdatedAt]
         );
       }
@@ -863,59 +865,72 @@ router.post('/terms/batch-delete', authenticateToken, writeLimiter, async (req, 
       termIds
     );
 
-    let deletedCount = 0;
-    let lockedSkipped = 0;
     const skippedLockedIds = [];
-    const deletedKwList = [];
-
+    const toDelete = [];
     for (const t of terms) {
       if (t.is_locked === 1 || t.is_locked === true) {
-        lockedSkipped++;
         skippedLockedIds.push(t.id);
         continue;
       }
-      // 走回收站: 备份完整 term + snapshots
-      const entityName = t.zh_cn || t.kw || t.id;
-      try {
-        await backupToRecycleBin('term', t.id, entityName, req.user.id);
-      } catch (e) {
-        console.error(`[batch-delete] backupToRecycleBin 失败, termId=${t.id}:`, e.message);
-        // 继续处理下一个, 不阻塞整体
-        continue;
-      }
-      // 硬删 term 行 (事务外, 因为 backupToRecycleBin 已独立写 recycle_bin)
-      if (dbType === 'postgres') {
-        await db.run('DELETE FROM terms WHERE id = $1', [t.id]);
-      } else {
-        await db.run('DELETE FROM terms WHERE id = $1', [t.id]);
-      }
-      deletedCount++;
-      deletedKwList.push(t.kw);
+      toDelete.push(t);
     }
 
-    // 写一条审计日志
-    if (deletedCount > 0) {
-      const details = `批量软删除 ${deletedCount} 条词条 (已送入回收站, 30 天后清理): ${deletedKwList.slice(0, 10).join(', ')}${deletedKwList.length > 10 ? ` ... 等 ${deletedKwList.length} 条` : ''}`;
-      const logsTable = dbType === 'postgres' ? 'logs' : 'logs_v2';
-      if (dbType === 'postgres') {
-        await db.run(
+    let deletedCount = 0;
+    let deletedKwList = [];
+
+    if (toDelete.length > 0) {
+      // 原子批量删除: 读取完整数据 → 单条多行 INSERT 备份 → 批量硬删，全部在
+      // 同一事务内。旧实现逐条「备份+删除」且在事务外（~4 次往返/条，最多
+      // 1600 次查询），部分失败会留下"已备份未删除"的混合状态。
+      deletedCount = await db.transaction(async (tx) => {
+        const delIds = toDelete.map(t => t.id);
+        const delPlaceholders = delIds.map((_, i) => `$${i + 1}`).join(',');
+        const fullTerms = await tx.query(
+          `SELECT * FROM terms WHERE id IN (${delPlaceholders})`,
+          delIds
+        );
+        const snapshots = await tx.query(
+          `SELECT * FROM term_snapshots WHERE term_id IN (${delPlaceholders})`,
+          delIds
+        );
+
+        const snapshotMap = new Map();
+        for (const s of snapshots) {
+          if (!snapshotMap.has(s.term_id)) snapshotMap.set(s.term_id, []);
+          snapshotMap.get(s.term_id).push(s);
+        }
+
+        const backupRows = fullTerms.map(term => ({
+          id: crypto.randomUUID(),
+          entityType: 'term',
+          entityName: term.zh_cn || term.kw || term.id,
+          payloadJson: JSON.stringify({
+            term,
+            snapshots: snapshotMap.get(term.id) || []
+          })
+        }));
+        await bulkInsertToRecycleBin(tx, backupRows, req.user.id);
+
+        // 硬删词条（term_snapshots 由外键 ON DELETE CASCADE 级联删除）
+        await tx.run(`DELETE FROM terms WHERE id IN (${delPlaceholders})`, delIds);
+
+        deletedKwList = fullTerms.map(t => t.kw);
+        const details = `批量软删除 ${fullTerms.length} 条词条 (已送入回收站, 30 天后清理): ${deletedKwList.slice(0, 10).join(', ')}${deletedKwList.length > 10 ? ` ... 等 ${deletedKwList.length} 条` : ''}`;
+        const logsTable = dbType === 'postgres' ? 'logs' : 'logs_v2';
+        const tsFunc = dbType === 'postgres' ? 'NOW()' : "datetime('now')";
+        await tx.run(
           `INSERT INTO ${logsTable} (timestamp, action, details, version_name, user_id)
-           VALUES (NOW(), '批量删除', $1, $2, $3)`,
+           VALUES (${tsFunc}, '批量删除', $1, $2, $3)`,
           [details, '', req.user.id]
         );
-      } else {
-        await db.run(
-          `INSERT INTO ${logsTable} (timestamp, action, details, version_name, user_id)
-           VALUES (datetime('now'), '批量删除', $1, $2, $3)`,
-          [details, '', req.user.id]
-        );
-      }
+        return fullTerms.length;
+      });
     }
 
     res.json({
       message: `成功删除 ${deletedCount} 条词条 (送入回收站, 30 天内可恢复)`,
       deletedCount,
-      lockedSkipped,
+      lockedSkipped: skippedLockedIds.length,
       skippedLockedIds,
     });
   } catch (err) {
@@ -987,6 +1002,11 @@ router.post('/terms/batch-copy', authenticateToken, async (req, res) => {
         existingMap[t.kw] = t;
       });
 
+      // 先在内存中完成全部判定, 再用批量语句写入:
+      // 旧实现逐条 DELETE+INSERT（每条 1-2 次往返）, 大批量复制时事务内往返次数线性膨胀。
+      const toInsert = [];
+      const toDeleteIds = [];
+
       for (const term of sourceTerms) {
         const exist = existingMap[term.kw];
         const newId = crypto.randomUUID();
@@ -1006,40 +1026,42 @@ router.post('/terms/batch-copy', authenticateToken, async (req, res) => {
 
             const targetSortOrder = exist.sort_order && exist.sort_order > 0 ? exist.sort_order : ++currentSortOrder;
 
-            await tx.run('DELETE FROM terms WHERE id = $1', [exist.id]);
-
-            if (dbType === 'postgres') {
-              await tx.run(
-                `INSERT INTO terms (id, version_id, kw, context, owner, zh_cn, translations, translations_meta, created_at, updated_at, is_locked, sort_order, status)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, NOW(), NOW(), FALSE, $9, 'DRAFT')`,
-                [newId, targetVersionId, term.kw, term.context, term.owner, term.zh_cn, transStr, metaStr, targetSortOrder]
-              );
-            } else {
-              await tx.run(
-                `INSERT INTO terms (id, version_id, kw, context, owner, zh_cn, translations, translations_meta, created_at, updated_at, is_locked, sort_order, status)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, datetime('now'), datetime('now'), 0, $9, 'DRAFT')`,
-                [newId, targetVersionId, term.kw, term.context, term.owner, term.zh_cn, transStr, metaStr, targetSortOrder]
-              );
-            }
+            toDeleteIds.push(exist.id);
+            toInsert.push({ id: newId, term, transStr, metaStr, sortOrder: targetSortOrder });
             overwriteCount++;
           }
         } else {
           currentSortOrder++;
-          if (dbType === 'postgres') {
-            await tx.run(
-              `INSERT INTO terms (id, version_id, kw, context, owner, zh_cn, translations, translations_meta, created_at, updated_at, is_locked, sort_order, status)
-               VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, NOW(), NOW(), FALSE, $9, 'DRAFT')`,
-              [newId, targetVersionId, term.kw, term.context, term.owner, term.zh_cn, transStr, metaStr, currentSortOrder]
-            );
-          } else {
-            await tx.run(
-              `INSERT INTO terms (id, version_id, kw, context, owner, zh_cn, translations, translations_meta, created_at, updated_at, is_locked, sort_order, status)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, datetime('now'), datetime('now'), 0, $9, 'DRAFT')`,
-              [newId, targetVersionId, term.kw, term.context, term.owner, term.zh_cn, transStr, metaStr, currentSortOrder]
-            );
-          }
+          toInsert.push({ id: newId, term, transStr, metaStr, sortOrder: currentSortOrder });
           copyCount++;
         }
+      }
+
+      // 分块批量 DELETE（500 id/块）
+      for (let i = 0; i < toDeleteIds.length; i += 500) {
+        const chunk = toDeleteIds.slice(i, i + 500);
+        const delPh = chunk.map((_, j) => `$${j + 1}`).join(',');
+        await tx.run(`DELETE FROM terms WHERE id IN (${delPh})`, chunk);
+      }
+
+      // 分块多行 VALUES 批量 INSERT（500 行/块 ≈ 4500 参数, 远低于 SQLite 32766 上限）
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const chunk = toInsert.slice(i, i + 500);
+        const valuesClauses = [];
+        const params = [];
+        chunk.forEach((row, j) => {
+          const b = j * 9;
+          const transPh = dbType === 'postgres' ? `$${b + 7}::jsonb` : `$${b + 7}`;
+          const metaPh = dbType === 'postgres' ? `$${b + 8}::jsonb` : `$${b + 8}`;
+          const tsCols = dbType === 'postgres' ? 'NOW(), NOW(), FALSE' : "datetime('now'), datetime('now'), 0";
+          valuesClauses.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, ${transPh}, ${metaPh}, ${tsCols}, $${b + 9}, 'DRAFT')`);
+          params.push(row.id, targetVersionId, row.term.kw, row.term.context, row.term.owner, row.term.zh_cn, row.transStr, row.metaStr, row.sortOrder);
+        });
+        await tx.run(
+          `INSERT INTO terms (id, version_id, kw, context, owner, zh_cn, translations, translations_meta, created_at, updated_at, is_locked, sort_order, status)
+           VALUES ${valuesClauses.join(', ')}`,
+          params
+        );
       }
 
       const totalMoved = copyCount + overwriteCount;
@@ -1103,136 +1125,157 @@ router.post('/tables/:tableId/batch-generate-kw', authenticateToken, async (req,
     let conflictCount = 0;
     const modifiedTerms = [];
 
-    await db.transaction(async (tx) => {
-      // 预取本版本已占用的 KW，用于批次内去重 + 冲突预检，
-      // 避免触发 UNIQUE(version_id, kw) 唯一约束导致整个事务回滚（整批 500）
-      const occupiedRows = await tx.query('SELECT id, kw FROM terms WHERE version_id = $1', [tableId]);
-      const kwHolder = new Map();
-      for (const r of occupiedRows) {
-        const k = (r.kw || '').trim();
-        if (k && !k.startsWith('__EMPTY_KW_')) kwHolder.set(k, r.id);
+    // ---- 阶段一（事务外）: 收集/生成 KW 计划 ----
+    // generateKwHelper 走外部 Dify HTTP（单条最坏 ~30s），绝不能放进数据库事务，
+    // 否则长事务占住连接池（max 10），几个并发批次即可拖垮全部请求。
+    // 本阶段只产出 plannedUpdates: [{ id, kw, oldKw, zh_cn }]，写入放到阶段二短事务。
+    const plannedUpdates = [];
+
+    if (Array.isArray(updates) && updates.length > 0) {
+      // 前端已提供批量生成后的 updates 映射列表: [{ id, kw }]
+      for (const item of updates) {
+        if (!item.id || !item.kw) continue;
+        plannedUpdates.push({ id: item.id, kw: String(item.kw).trim(), oldKw: null, zh_cn: null });
       }
-      const batchUsed = new Set();
-
-      // 尝试为本行占用一个 KW；批次内重复或已被其他词条占用时返回 false
-      const tryReserveKw = (kw, termId) => {
-        if (!kw) return false;
-        if (batchUsed.has(kw)) return false;
-        const holder = kwHolder.get(kw);
-        if (holder && holder !== termId) return false;
-        batchUsed.add(kw);
-        kwHolder.set(kw, termId);
-        return true;
-      };
-
-      // 若前端已提供批量生成后的 updates 映射列表: [{ id, kw }]
-      if (Array.isArray(updates) && updates.length > 0) {
-        for (const item of updates) {
-          if (!item.id || !item.kw) continue;
-          const kw = String(item.kw).trim();
-          if (!tryReserveKw(kw, item.id)) {
-            conflictCount++;
-            skippedCount++;
-            continue;
-          }
-          if (dbType === 'postgres') {
-            await tx.run(
-              'UPDATE terms SET kw = $1, updated_at = NOW() WHERE id = $2 AND version_id = $3',
-              [kw, item.id, tableId]
-            );
-          } else {
-            await tx.run(
-              "UPDATE terms SET kw = $1, updated_at = datetime('now') WHERE id = $2 AND version_id = $3",
-              [kw, item.id, tableId]
-            );
-          }
-          updatedCount++;
-          modifiedTerms.push({ id: item.id, kw });
-        }
+    } else {
+      // 后端直接查询候选词条并执行生成
+      let candidates = [];
+      if (Array.isArray(termIds) && termIds.length > 0) {
+        const placeholders = termIds.map((_, i) => `$${i + 2}`).join(',');
+        candidates = await db.query(
+          `SELECT id, kw, zh_cn, translations, context, is_locked FROM terms WHERE version_id = $1 AND id IN (${placeholders})`,
+          [tableId, ...termIds]
+        );
       } else {
-        // 后端直接查询候选词条并执行生成
-        let candidates = [];
-        if (Array.isArray(termIds) && termIds.length > 0) {
-          const placeholders = termIds.map((_, i) => `$${i + 2}`).join(',');
-          candidates = await tx.query(
-            `SELECT id, kw, zh_cn, translations, context, is_locked FROM terms WHERE version_id = $1 AND id IN (${placeholders})`,
-            [tableId, ...termIds]
-          );
-        } else {
-          // 全表扫描
-          candidates = await tx.query(
-            'SELECT id, kw, zh_cn, translations, context, is_locked FROM terms WHERE version_id = $1',
-            [tableId]
-          );
+        // 全表扫描
+        candidates = await db.query(
+          'SELECT id, kw, zh_cn, translations, context, is_locked FROM terms WHERE version_id = $1',
+          [tableId]
+        );
+      }
+
+      const generationTargets = [];
+      for (const term of candidates) {
+        if (term.is_locked === 1 || term.is_locked === true) {
+          skippedCount++;
+          continue;
         }
+        const isKwEmpty = !term.kw || !term.kw.trim() || term.kw.startsWith('__EMPTY_KW_');
+        if (!isKwEmpty && !overwrite) {
+          skippedCount++;
+          continue;
+        }
+        generationTargets.push(term);
+      }
 
-        for (const term of candidates) {
-          if (term.is_locked === 1 || term.is_locked === true) {
-            skippedCount++;
-            continue;
-          }
-          const isKwEmpty = !term.kw || !term.kw.trim() || term.kw.startsWith('__EMPTY_KW_');
-          if (!isKwEmpty && !overwrite) {
-            skippedCount++;
-            continue;
-          }
-
+      // 受控并发（3 个 worker）调用外部 Dify，避免全表串行拖长总耗时
+      const GENERATE_CONCURRENCY = 3;
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < generationTargets.length) {
+          const term = generationTargets[cursor++];
           let enText = '';
           if (term.translations) {
             const parsed = parseJsonField(term.translations);
             enText = parsed['EN（英文）'] || parsed['EN'] || parsed['en'] || '';
           }
-
-          const generatedKw = await generateKwHelper(projectId, term.zh_cn, enText, term.context);
-          if (generatedKw) {
-            if (!tryReserveKw(generatedKw, term.id)) {
-              conflictCount++;
-              skippedCount++;
-              continue;
-            }
-            // 覆盖写时释放本行旧 KW 占用，避免其干扰同批次后续条目的冲突判定
-            const oldKw = (term.kw || '').trim();
-            if (oldKw && !oldKw.startsWith('__EMPTY_KW_') && oldKw !== generatedKw && kwHolder.get(oldKw) === term.id) {
-              kwHolder.delete(oldKw);
-            }
-            if (dbType === 'postgres') {
-              await tx.run(
-                'UPDATE terms SET kw = $1, updated_at = NOW() WHERE id = $2',
-                [generatedKw, term.id]
-              );
+          try {
+            const generatedKw = await generateKwHelper(projectId, term.zh_cn, enText, term.context);
+            if (generatedKw) {
+              plannedUpdates.push({ id: term.id, kw: generatedKw, oldKw: (term.kw || '').trim() || null, zh_cn: term.zh_cn });
             } else {
-              await tx.run(
-                "UPDATE terms SET kw = $1, updated_at = datetime('now') WHERE id = $2",
-                [generatedKw, term.id]
-              );
+              skippedCount++;
             }
-            updatedCount++;
-            modifiedTerms.push({ id: term.id, kw: generatedKw, zh_cn: term.zh_cn });
-          } else {
+          } catch (genErr) {
+            console.error(`[batch-generate-kw] 单条生成失败 termId=${term.id}:`, genErr.message);
             skippedCount++;
           }
         }
-      }
+      };
+      await Promise.all(
+        Array.from({ length: Math.max(1, Math.min(GENERATE_CONCURRENCY, generationTargets.length)) }, worker)
+      );
+    }
 
-      if (updatedCount > 0) {
-        const logsTable = dbType === 'postgres' ? 'logs' : 'logs_v2';
-        const details = `批量自动生成 KW 键名：成功更新 ${updatedCount} 条词条${skippedCount > 0 ? `，跳过 ${skippedCount} 条` : ''}。`;
-
-        if (dbType === 'postgres') {
-          await tx.run(
-            `INSERT INTO ${logsTable} (timestamp, action, details, version_name, user_id)
-             VALUES (NOW(), '批量生成KW', $1, $2, $3)`,
-            [details, version.version_name, req.user.id]
-          );
-        } else {
-          await tx.run(
-            `INSERT INTO ${logsTable} (timestamp, action, details, version_name, user_id)
-             VALUES (datetime('now'), '批量生成KW', $1, $2, $3)`,
-            [details, version.version_name, req.user.id]
-          );
+    // ---- 阶段二（短事务）: 基于数据库最新状态判定冲突并写入 ----
+    // 唯一约束仍是最终裁决: 条件 UPDATE 自带 NOT EXISTS 防护，万一竞态击穿会抛 23505，
+    // 事务整体回滚（无部分写入），由路由层转为 409 提示重试。
+    if (plannedUpdates.length > 0) {
+      await db.transaction(async (tx) => {
+        // 事务内重新读取本版本已占用 KW（最新状态），避免阶段一期间的并发变化
+        const occupiedRows = await tx.query('SELECT id, kw FROM terms WHERE version_id = $1', [tableId]);
+        const kwHolder = new Map();
+        for (const r of occupiedRows) {
+          const k = (r.kw || '').trim();
+          if (k && !k.startsWith('__EMPTY_KW_')) kwHolder.set(k, r.id);
         }
-      }
-    });
+        const batchUsed = new Map();
+
+        // 尝试为本行占用一个 KW；批次内重复或已被其他词条占用时返回 false
+        const tryReserveKw = (kw, termId) => {
+          if (!kw) return false;
+          if (batchUsed.has(kw) && batchUsed.get(kw) !== termId) return false;
+          const holder = kwHolder.get(kw);
+          if (holder && holder !== termId) return false;
+          batchUsed.set(kw, termId);
+          return true;
+        };
+
+        // 条件更新: 目标 KW 仍被其他词条占用时不写入（rowCount=0 → 冲突）
+        const condUpdate = dbType === 'postgres'
+          ? `UPDATE terms SET kw = $1, updated_at = NOW()
+             WHERE id = $2 AND version_id = $3
+               AND NOT EXISTS (SELECT 1 FROM terms t2 WHERE t2.version_id = $3 AND t2.kw = $1 AND t2.id <> $2)`
+          : `UPDATE terms SET kw = $1, updated_at = datetime('now')
+             WHERE id = $2 AND version_id = $3
+               AND NOT EXISTS (SELECT 1 FROM terms t2 WHERE t2.version_id = $3 AND t2.kw = $1 AND t2.id <> $2)`;
+
+        for (const item of plannedUpdates) {
+          if (!item.kw) {
+            skippedCount++;
+            continue;
+          }
+          if (!tryReserveKw(item.kw, item.id)) {
+            conflictCount++;
+            skippedCount++;
+            continue;
+          }
+          const result = await tx.run(condUpdate, [item.kw, item.id, tableId]);
+          if (result.changes === 0) {
+            // 数据库层判定冲突（阶段一之后该 KW 又被占用）
+            batchUsed.delete(item.kw);
+            conflictCount++;
+            skippedCount++;
+            continue;
+          }
+          // 覆盖写时释放本行旧 KW 占用，避免其干扰同批次后续条目的冲突判定
+          if (item.oldKw && item.oldKw !== item.kw && kwHolder.get(item.oldKw) === item.id) {
+            kwHolder.delete(item.oldKw);
+          }
+          updatedCount++;
+          modifiedTerms.push(item.zh_cn ? { id: item.id, kw: item.kw, zh_cn: item.zh_cn } : { id: item.id, kw: item.kw });
+        }
+
+        if (updatedCount > 0) {
+          const logsTable = dbType === 'postgres' ? 'logs' : 'logs_v2';
+          const details = `批量自动生成 KW 键名：成功更新 ${updatedCount} 条词条${skippedCount > 0 ? `，跳过 ${skippedCount} 条` : ''}。`;
+
+          if (dbType === 'postgres') {
+            await tx.run(
+              `INSERT INTO ${logsTable} (timestamp, action, details, version_name, user_id)
+               VALUES (NOW(), '批量生成KW', $1, $2, $3)`,
+              [details, version.version_name, req.user.id]
+            );
+          } else {
+            await tx.run(
+              `INSERT INTO ${logsTable} (timestamp, action, details, version_name, user_id)
+               VALUES (datetime('now'), '批量生成KW', $1, $2, $3)`,
+              [details, version.version_name, req.user.id]
+            );
+          }
+        }
+      });
+    }
 
     res.json({
       message: `成功为 ${updatedCount} 条词条生成并更新 KW 键名！${conflictCount > 0 ? `（${conflictCount} 条因 KW 重复已跳过）` : ''}`,
@@ -1242,6 +1285,9 @@ router.post('/tables/:tableId/batch-generate-kw', authenticateToken, async (req,
       modifiedTerms
     });
   } catch (err) {
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'KW_CONFLICT', message: '存在并发 KW 冲突（其他用户同时写入了相同 KW），请重试。' });
+    }
     console.error('批量生成 KW 失败:', err);
     res.status(500).json({ error: '批量生成 KW 失败: ' + err.message });
   }
@@ -1344,14 +1390,15 @@ router.post('/tables/:tableId/sync', authenticateToken, writeLimiter, async (req
         await tx.query(`DELETE FROM terms WHERE id IN (${placeholders}) AND version_id = $${deletedIds.length + 1} AND (is_locked IS NOT TRUE)`, [...deletedIds, tableId]);
       }
 
-      // 2. Insert (Added)
-      // sort_order 自增基数在循环外只查一次, 内存递增 (避免逐条 SELECT MAX 的重复查询)
+      // 2. Insert (Added) — JS 侧先完成字段归一/排序号分配, 再分块多行 upsert
+      // (旧实现逐条 INSERT, 每条一次数据库往返; CSV 大导入时事务内往返线性膨胀)
       const maxSortRow = await tx.queryOne(
         'SELECT COALESCE(MAX(sort_order), 0) as max_sort FROM terms WHERE version_id = $1',
         [tableId]
       );
       let nextSortOrder = parseInt(maxSortRow?.max_sort || 0, 10);
 
+      const addedRows = [];
       for (const rec of added) {
         let kwVal = (rec.fields['KW'] || rec.kw || '').trim();
         if (!kwVal) {
@@ -1385,17 +1432,7 @@ router.post('/tables/:tableId/sync', authenticateToken, writeLimiter, async (req
         // 显式传入的 sortOrder 可能高于当前基数, 同步抬升基数避免后续自增与其冲突
         nextSortOrder = Math.max(nextSortOrder, sortOrder);
 
-        await tx.query(`
-          INSERT INTO terms (id, version_id, kw, context, zh_cn, translations, translations_meta, is_locked, status, sort_order, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-          ON CONFLICT (version_id, kw) DO UPDATE SET
-            context = EXCLUDED.context,
-            zh_cn = EXCLUDED.zh_cn,
-            translations = EXCLUDED.translations,
-            translations_meta = EXCLUDED.translations_meta,
-            sort_order = EXCLUDED.sort_order,
-            updated_at = EXCLUDED.updated_at
-        `, [
+        addedRows.push([
           rec.recordId,
           tableId,
           kwVal,
@@ -1412,9 +1449,52 @@ router.post('/tables/:tableId/sync', authenticateToken, writeLimiter, async (req
         successCount++;
       }
 
-      // 3. Update (Modified)
+      // 同批内 (version_id, kw) 冲突预去重: PG 的多行 upsert 不允许一条语句内
+      // 两次命中同一冲突行, 保留后出现的记录与逐条 upsert 的覆盖语义一致
+      const seenKw = new Map();
+      for (const row of addedRows) {
+        seenKw.set(row[2], row);
+      }
+      const dedupedAdded = [...seenKw.values()];
+
+      const UPSERT_CHUNK = 250; // 每行 12 参数, 250 行 = 3000 参数, 远低于 SQLite 上限
+      for (let i = 0; i < dedupedAdded.length; i += UPSERT_CHUNK) {
+        const chunk = dedupedAdded.slice(i, i + UPSERT_CHUNK);
+        const valuesClauses = [];
+        const params = [];
+        chunk.forEach((row, j) => {
+          const b = j * 12;
+          valuesClauses.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9}, $${b + 10}, $${b + 11}, $${b + 12})`);
+          params.push(...row);
+        });
+        await tx.query(`
+          INSERT INTO terms (id, version_id, kw, context, zh_cn, translations, translations_meta, is_locked, status, sort_order, created_at, updated_at)
+          VALUES ${valuesClauses.join(', ')}
+          ON CONFLICT (version_id, kw) DO UPDATE SET
+            context = EXCLUDED.context,
+            zh_cn = EXCLUDED.zh_cn,
+            translations = EXCLUDED.translations,
+            translations_meta = EXCLUDED.translations_meta,
+            sort_order = EXCLUDED.sort_order,
+            updated_at = EXCLUDED.updated_at
+        `, params);
+      }
+
+      // 3. Update (Modified) — 批量预读现有值后合并, 仍逐条 UPDATE 以保留
+      // 每行可选的 sort_order 更新与 is_locked 过滤语义
+      const updateIds = updated.map(r => r.recordId).filter(Boolean);
+      const existingMap = new Map();
+      if (updateIds.length > 0) {
+        const updatePh = updateIds.map((_, i) => `$${i + 1}`).join(',');
+        const existingRows = await tx.query(
+          `SELECT id, kw, zh_cn, context, translations, translations_meta FROM terms WHERE id IN (${updatePh})`,
+          updateIds
+        );
+        existingRows.forEach(r => existingMap.set(r.id, r));
+      }
+
       for (const rec of updated) {
-        const existing = await tx.queryOne('SELECT kw, zh_cn, context, translations, translations_meta FROM terms WHERE id = $1', [rec.recordId]);
+        const existing = existingMap.get(rec.recordId) || null;
         
         let kwVal = rec.fields && rec.fields['KW'] !== undefined 
           ? rec.fields['KW'].trim() 
@@ -1491,14 +1571,27 @@ router.post('/tables/:tableId/sync', authenticateToken, writeLimiter, async (req
         ]);
         successCount++;
       }
-      // 4. Reorder (sort_order only updates for unchanged records)
-      for (const rec of reorder) {
-        if (rec.recordId && rec.sortOrder !== undefined) {
-          await tx.query(
-            'UPDATE terms SET sort_order = $1 WHERE id = $2 AND version_id = $3',
-            [rec.sortOrder, rec.recordId, tableId]
-          );
-        }
+      // 4. Reorder (sort_order only updates for unchanged records) — CASE 批量更新
+      const validReorders = reorder.filter(r => r.recordId && r.sortOrder !== undefined);
+      for (let i = 0; i < validReorders.length; i += 500) {
+        const chunk = validReorders.slice(i, i + 500);
+        const whenClauses = [];
+        const inPhs = [];
+        const params = [];
+        chunk.forEach((r, j) => {
+          whenClauses.push(`WHEN $${2 * j + 1} THEN $${2 * j + 2}`);
+          params.push(r.recordId, r.sortOrder);
+        });
+        const base = 2 * chunk.length;
+        chunk.forEach((_r, j) => inPhs.push(`$${base + j + 1}`));
+        // SQLite 的 $N 转换后是位置参数, 不能复用, IN 列表的 id 需要再次传参
+        chunk.forEach(r => params.push(r.recordId));
+        params.push(tableId);
+        await tx.query(
+          `UPDATE terms SET sort_order = CASE id ${whenClauses.join(' ')} END
+           WHERE id IN (${inPhs.join(',')}) AND version_id = $${base + chunk.length + 1}`,
+          params
+        );
       }
 
       // 5. 记录同步审计日志

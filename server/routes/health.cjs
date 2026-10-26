@@ -3,6 +3,10 @@ const router = express.Router();
 const { db, ensureDbInit, getDbType, getPgError, getPgDebug } = require('../config/db.cjs');
 const { authenticateToken } = require('../middleware/auth.cjs');
 
+// 回收站过期清理节流间隔: 1 小时
+const RECYCLE_PURGE_INTERVAL_MS = 60 * 60 * 1000;
+let lastRecyclePurgeAt = 0;
+
 router.get('/health', async (_req, res) => {
   let dbStatus = 'ok';
   let dbLatency = 0;
@@ -13,6 +17,17 @@ router.get('/health', async (_req, res) => {
     // 实际执行一条轻量查询，既能探测真实连接状态，也能持续刷新 Supabase 的 7 天不活跃休眠倒计时
     await db.queryOne('SELECT 1 as ping');
     dbLatency = Date.now() - start;
+
+    // 回收站过期清理原本只在有人打开回收站列表时"懒触发"；
+    // /health 被 keepalive 定时任务周期性调用，顺带节流清理，
+    // 避免无人访问时过期 payload（含整版本词条快照）在库里静默堆积。不阻塞探测响应。
+    if (Date.now() - lastRecyclePurgeAt > RECYCLE_PURGE_INTERVAL_MS) {
+      lastRecyclePurgeAt = Date.now();
+      const purgeSql = getDbType() === 'postgres'
+        ? `DELETE FROM recycle_bin WHERE expires_at < NOW()`
+        : `DELETE FROM recycle_bin WHERE datetime(expires_at) < datetime('now')`;
+      db.run(purgeSql).catch(err => console.warn('♻️ /health 回收站过期清理失败:', err.message));
+    }
   } catch (err) {
     dbStatus = 'error';
     console.error('🩺 /health 数据库主动探测失败:', err.message);
